@@ -205,7 +205,9 @@ class IaxHandler(ProtocolHandler):
         try:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._sock.settimeout(1.0)
-            self._sock.bind(("", 0))
+            local_port = int(config.get("local_port", 0)) or 0
+            self._sock.bind(("", local_port))
+            logger.info("IAX2 bound to local port %s", local_port or "auto")
             self._running = True
             self._recv_thread = threading.Thread(target=self._receive_loop,
                                                  daemon=True, name="iax-recv")

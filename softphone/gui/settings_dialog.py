@@ -16,7 +16,7 @@ class SettingsDialog(tk.Toplevel):
         self.result = None
 
         self.title("Settings")
-        self.geometry("480x560")
+        self.geometry("480x640")
         self.configure(bg=self.colors["bg"])
         self.transient(parent)
         self.grab_set()
@@ -112,6 +112,8 @@ class SettingsDialog(tk.Toplevel):
         self._checkbox(f, "Enable SIP", "sip.enabled")
         self._field(f, "Server:", "sip.server")
         self._field(f, "Port:", "sip.port")
+        self._field(f, "Local Port:", "sip.local_port")
+        self._checkbox(f, "Enable rport (RFC 3581 NAT traversal)", "sip.rport")
         self._field(f, "Username:", "sip.username")
         self._field(f, "Password:", "sip.password", show="*")
         self._field(f, "Display Name:", "sip.display_name")
@@ -134,6 +136,7 @@ class SettingsDialog(tk.Toplevel):
         self._checkbox(f, "Enable IAX", "iax.enabled")
         self._field(f, "Server:", "iax.server")
         self._field(f, "Port:", "iax.port")
+        self._field(f, "Local Port:", "iax.local_port")
         self._field(f, "Username:", "iax.username")
         self._field(f, "Password:", "iax.password", show="*")
         self._field(f, "Display Name:", "iax.display_name")
@@ -192,12 +195,15 @@ class SettingsDialog(tk.Toplevel):
             for p in parts[:-1]:
                 target = target.setdefault(p, {})
             value = var.get()
-            # Convert port to int
-            if parts[-1] == "port":
+            # Convert port fields to int
+            if parts[-1] in ("port", "local_port"):
                 try:
                     value = int(value)
                 except ValueError:
-                    value = 5060 if parts[0] == "sip" else 4569
+                    if parts[-1] == "local_port":
+                        value = 0
+                    else:
+                        value = 5060 if parts[0] == "sip" else 4569
             elif isinstance(var, tk.BooleanVar):
                 value = var.get()
             target[parts[-1]] = value

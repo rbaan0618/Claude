@@ -144,10 +144,12 @@ class SipHandler(ProtocolHandler):
                 transport_type = pj.PJSIP_TRANSPORT_TLS
 
             tp_cfg = pj.TransportConfig()
-            tp_cfg.port = 0  # Auto-select port
+            local_port = config.get("local_port", 0)
+            tp_cfg.port = int(local_port) if local_port else 0
             self._transport = self._endpoint.transportCreate(transport_type, tp_cfg)
             self._endpoint.libStart()
-            logger.info("PJSUA2 SIP stack initialized")
+            logger.info("PJSUA2 SIP stack initialized on local port %s",
+                        local_port or "auto")
             return True
         except Exception as e:
             logger.error("Failed to initialize SIP: %s", e)
@@ -167,6 +169,14 @@ class SipHandler(ProtocolHandler):
 
             cred = pj.AuthCredInfo("digest", "*", username, 0, password)
             acc_cfg.sipConfig.authCreds.append(cred)
+
+            # Enable rport (RFC 3581) for NAT traversal
+            if self._config.get("rport", True):
+                acc_cfg.sipConfig.proxies = [f"sip:{server}:{port};rport"]
+                # Add rport to Via header via account NAT config
+                acc_cfg.natConfig.viaRportUse = 1   # PJSUA_VIA_RPORT_ALWAYS
+                acc_cfg.natConfig.sdpNatRewriteUse = 1
+                logger.info("SIP rport enabled for NAT traversal")
 
             if self._config.get("display_name"):
                 acc_cfg.idUri = f'"{ self._config["display_name"]}" <sip:{username}@{server}>'
