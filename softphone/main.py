@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PySoftphone — SIP/IAX2 softphone for Windows.
+"""My Line Telecom Softphone — SIP softphone for Windows.
 
 Usage:
     python main.py

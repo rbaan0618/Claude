@@ -1,8 +1,14 @@
-"""Settings dialog for configuring SIP, IAX, and audio settings."""
+"""Settings dialog for configuring SIP and audio settings."""
 
 import tkinter as tk
 from tkinter import ttk
 from gui.theme import get_theme
+
+try:
+    import pyaudio
+    PYAUDIO_AVAILABLE = True
+except ImportError:
+    PYAUDIO_AVAILABLE = False
 
 
 class SettingsDialog(tk.Toplevel):
@@ -40,7 +46,7 @@ class SettingsDialog(tk.Toplevel):
         container = tk.Frame(self, bg=c["bg"])
         container.pack(fill=tk.BOTH, expand=True)
 
-        for tab_name in ["SIP", "IAX", "Audio", "General"]:
+        for tab_name in ["SIP", "Audio", "General"]:
             # Tab button
             btn = tk.Label(tab_bar, text=tab_name, font=("Segoe UI", 10),
                            bg=c["bg_secondary"], fg=c["fg"], cursor="hand2",
@@ -54,7 +60,6 @@ class SettingsDialog(tk.Toplevel):
             self._tab_frames[tab_name] = frame
 
         self._build_sip_tab()
-        self._build_iax_tab()
         self._build_audio_tab()
         self._build_general_tab()
 
@@ -148,28 +153,60 @@ class SettingsDialog(tk.Toplevel):
                            activebackground=c["bg"], font=("Segoe UI", 10)
                            ).pack(side=tk.LEFT, padx=(0, 10))
 
-    def _build_iax_tab(self):
-        f = self._tab_frames["IAX"]
-        self._checkbox(f, "Enable IAX", "iax.enabled")
-        self._server_field(f, "Server:", "iax.server")
-        self._field(f, "Port:", "iax.port")
-        self._field(f, "Local Port:", "iax.local_port")
-        self._field(f, "Username:", "iax.username")
-        self._field(f, "Password:", "iax.password", show="*")
-        self._field(f, "Display Name:", "iax.display_name")
+    def _get_audio_devices(self):
+        """Query available audio input and output devices via pyaudio."""
+        input_devices = [("System Default", "")]
+        output_devices = [("System Default", "")]
+        if not PYAUDIO_AVAILABLE:
+            return input_devices, output_devices
+        try:
+            pa = pyaudio.PyAudio()
+            seen_in, seen_out = set(), set()
+            for i in range(pa.get_device_count()):
+                info = pa.get_device_info_by_index(i)
+                name = info["name"]
+                if info["maxInputChannels"] > 0 and name not in seen_in:
+                    seen_in.add(name)
+                    input_devices.append((name, str(i)))
+                if info["maxOutputChannels"] > 0 and name not in seen_out:
+                    seen_out.add(name)
+                    output_devices.append((name, str(i)))
+            pa.terminate()
+        except Exception:
+            pass
+        return input_devices, output_devices
+
+    def _device_dropdown(self, parent, label, key, devices):
+        """Create a labeled dropdown for audio device selection."""
+        c = self.colors
+        tk.Label(parent, text=label, bg=c["bg"], fg=c["fg"],
+                 font=("Segoe UI", 10)).pack(anchor=tk.W, pady=(8, 2))
+        var = tk.StringVar()
+        self._vars[key] = var
+        # Store mapping: display name -> device index string
+        name_to_idx = {name: idx for name, idx in devices}
+        self._device_maps[key] = name_to_idx
+        names = [name for name, _ in devices]
+        combo = ttk.Combobox(parent, textvariable=var, values=names,
+                             state="readonly", font=("Segoe UI", 10))
+        combo.pack(fill=tk.X)
+        return var
 
     def _build_audio_tab(self):
         f = self._tab_frames["Audio"]
         c = self.colors
+        self._device_maps = {}
 
-        tk.Label(f, text="Audio devices are auto-detected.\n"
-                 "Leave blank to use system defaults.",
-                 bg=c["bg"], fg=c["fg_dim"], font=("Segoe UI", 9),
-                 justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 5))
+        input_devs, output_devs = self._get_audio_devices()
 
-        self._field(f, "Input Device:", "audio.input_device")
-        self._field(f, "Output Device:", "audio.output_device")
-        self._field(f, "Ring Device:", "audio.ring_device")
+        if not PYAUDIO_AVAILABLE:
+            tk.Label(f, text="pyaudio not installed — audio device selection unavailable.",
+                     bg=c["bg"], fg=c["red"], font=("Segoe UI", 9),
+                     justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 5))
+
+        self._device_dropdown(f, "Microphone (Input):", "audio.input_device", input_devs)
+        self._device_dropdown(f, "Speaker (Output):", "audio.output_device", output_devs)
+        self._device_dropdown(f, "Ringtone Device:", "audio.ring_device", output_devs)
 
     def _build_general_tab(self):
         f = self._tab_frames["General"]
@@ -201,6 +238,10 @@ class SettingsDialog(tk.Toplevel):
                     break
             if isinstance(var, tk.BooleanVar):
                 var.set(bool(value))
+            elif key in getattr(self, "_device_maps", {}):
+                # Audio device dropdown — value is device index, show name
+                idx_to_name = {idx: name for name, idx in self._device_maps[key].items()}
+                var.set(idx_to_name.get(str(value), "System Default"))
             else:
                 # Strip .myline.tel suffix for server fields display
                 s = str(value)
@@ -216,8 +257,11 @@ class SettingsDialog(tk.Toplevel):
             for p in parts[:-1]:
                 target = target.setdefault(p, {})
             value = var.get()
+            # Audio device dropdowns — convert display name to device index
+            if key in getattr(self, "_device_maps", {}):
+                value = self._device_maps[key].get(value, "")
             # Auto-append .myline.tel for server fields without a dot
-            if parts[-1] == "server" and isinstance(value, str) and value.strip():
+            elif parts[-1] == "server" and isinstance(value, str) and value.strip():
                 value = value.strip()
                 if "." not in value:
                     value = value + ".myline.tel"
@@ -229,7 +273,7 @@ class SettingsDialog(tk.Toplevel):
                     if parts[-1] == "local_port":
                         value = 0
                     else:
-                        value = 5060 if parts[0] == "sip" else 4569
+                        value = 5060
             elif isinstance(var, tk.BooleanVar):
                 value = var.get()
             target[parts[-1]] = value

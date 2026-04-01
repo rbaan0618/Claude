@@ -125,6 +125,7 @@ class Dialpad(tk.Frame):
         mid_frame = tk.Frame(self, bg=c["bg"])
         mid_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
 
+        self._mid_buttons = {}
         for text, cmd in [("Hold", "hold"), ("Transfer", "transfer"), ("Mute", "mute")]:
             btn = tk.Label(
                 mid_frame, text=text, font=("Segoe UI", 10),
@@ -133,6 +134,7 @@ class Dialpad(tk.Frame):
             )
             btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
             btn.bind("<Button-1>", lambda e, c=cmd: self._mid_call_action(c))
+            self._mid_buttons[cmd] = btn
 
     def _press(self, digit):
         self.number_var.set(self.number_var.get() + digit)
@@ -172,6 +174,26 @@ class Dialpad(tk.Frame):
         self.hide_incoming()
         if self._on_answer:
             self._on_answer()
+
+    def set_mute_active(self, active):
+        """Toggle mute button color — red when active."""
+        c = self.colors
+        btn = self._mid_buttons.get("mute")
+        if btn:
+            if active:
+                btn.configure(bg=c["red"], fg="#ffffff")
+            else:
+                btn.configure(bg=c["button_bg"], fg=c["button_fg"])
+
+    def set_hold_active(self, active):
+        """Toggle hold button color — red when active."""
+        c = self.colors
+        btn = self._mid_buttons.get("hold")
+        if btn:
+            if active:
+                btn.configure(bg=c["red"], fg="#ffffff")
+            else:
+                btn.configure(bg=c["button_bg"], fg=c["button_fg"])
 
     def set_number(self, number):
         self.number_var.set(number)

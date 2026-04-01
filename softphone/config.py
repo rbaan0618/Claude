@@ -15,15 +15,6 @@ DEFAULT_CONFIG = {
         "transport": "UDP",
         "display_name": "",
     },
-    "iax": {
-        "enabled": False,
-        "server": "",
-        "port": 4569,
-        "local_port": 4569,
-        "username": "",
-        "password": "",
-        "display_name": "",
-    },
     "audio": {
         "input_device": "",
         "output_device": "",

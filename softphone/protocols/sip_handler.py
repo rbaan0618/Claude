@@ -135,7 +135,7 @@ class RtpSession:
     FRAME_SIZE = 160  # 20ms at 8000Hz
     PTIME = 20  # ms
 
-    def __init__(self, local_port):
+    def __init__(self, local_port, input_device=None, output_device=None):
         self._local_port = local_port
         self._remote_addr = None
         self._sock = None
@@ -149,6 +149,8 @@ class RtpSession:
         self._input_stream = None
         self._output_stream = None
         self._muted = False
+        self._input_device = input_device
+        self._output_device = output_device
 
     def start(self, remote_ip, remote_port):
         """Start RTP audio session."""
@@ -163,14 +165,18 @@ class RtpSession:
         if PYAUDIO_AVAILABLE:
             try:
                 self._pa = pyaudio.PyAudio()
-                self._input_stream = self._pa.open(
-                    format=pyaudio.paInt16, channels=1,
-                    rate=self.SAMPLE_RATE, input=True,
-                    frames_per_buffer=self.FRAME_SIZE)
-                self._output_stream = self._pa.open(
-                    format=pyaudio.paInt16, channels=1,
-                    rate=self.SAMPLE_RATE, output=True,
-                    frames_per_buffer=self.FRAME_SIZE)
+                in_kwargs = dict(format=pyaudio.paInt16, channels=1,
+                                 rate=self.SAMPLE_RATE, input=True,
+                                 frames_per_buffer=self.FRAME_SIZE)
+                if self._input_device is not None:
+                    in_kwargs["input_device_index"] = self._input_device
+                self._input_stream = self._pa.open(**in_kwargs)
+                out_kwargs = dict(format=pyaudio.paInt16, channels=1,
+                                  rate=self.SAMPLE_RATE, output=True,
+                                  frames_per_buffer=self.FRAME_SIZE)
+                if self._output_device is not None:
+                    out_kwargs["output_device_index"] = self._output_device
+                self._output_stream = self._pa.open(**out_kwargs)
                 logger.info("RTP audio streams opened (port %d -> %s:%d)",
                             actual_port, remote_ip, remote_port)
             except Exception as e:
@@ -372,12 +378,20 @@ class SipHandler(ProtocolHandler):
         self._cached_sdp = ""   # Cached SDP body for INVITE re-send with auth
         self._rtp_session: Optional[RtpSession] = None
         self._rtp_port = 0
+        self._on_hold = False
+        self._hold_pending = False  # True while re-INVITE for hold/unhold is in flight
+        # Attended transfer — saved original call state
+        self._held_call = None  # dict with saved call state during consultation
         # BLF
         self._blf_subscriptions = {}
 
     @property
     def protocol_name(self) -> str:
         return "SIP"
+
+    @property
+    def on_hold(self) -> bool:
+        return self._on_hold
 
     def _get_local_ip(self, server):
         """Determine the local IP that can reach the server."""
@@ -569,7 +583,7 @@ class SipHandler(ProtocolHandler):
         sdp = (
             "v=0\r\n"
             f"o=pysoftphone 0 0 IN IP4 {sdp_ip}\r\n"
-            "s=PySoftphone\r\n"
+            "s=MyLineTelecom\r\n"
             f"c=IN IP4 {sdp_ip}\r\n"
             "t=0 0\r\n"
             f"m=audio {rtp_port} RTP/AVP 0 101\r\n"
@@ -583,8 +597,9 @@ class SipHandler(ProtocolHandler):
 
     # -- Protocol interface --------------------------------------------------
 
-    def initialize(self, config: dict) -> bool:
+    def initialize(self, config: dict, audio_config: dict = None) -> bool:
         self._config = config
+        self._audio_config = audio_config or {}
         self._use_rport = config.get("rport", True)
         self._local_port = int(config.get("local_port", 5060)) or 5060
         try:
@@ -656,7 +671,7 @@ class SipHandler(ProtocolHandler):
             f"CSeq: {self._reg_cseq} REGISTER\r\n"
             f"Contact: {self._contact_header()}\r\n"
             f"Max-Forwards: 70\r\n"
-            f"User-Agent: PySoftphone/1.0\r\n"
+            f"User-Agent: MyLineTelecom/1.0\r\n"
             f"Expires: {self._reg_expires}\r\n"
             f"Content-Length: 0\r\n"
             f"\r\n"
@@ -684,7 +699,7 @@ class SipHandler(ProtocolHandler):
             f"CSeq: {self._reg_cseq} REGISTER\r\n"
             f"Contact: {self._contact_header()}\r\n"
             f"Max-Forwards: 70\r\n"
-            f"User-Agent: PySoftphone/1.0\r\n"
+            f"User-Agent: MyLineTelecom/1.0\r\n"
             f"Expires: {self._reg_expires}\r\n"
             f"{auth_line}\r\n"
             f"Content-Length: 0\r\n"
@@ -712,7 +727,7 @@ class SipHandler(ProtocolHandler):
             f"CSeq: {self._reg_cseq} REGISTER\r\n"
             f"Contact: {self._contact_header()}\r\n"
             f"Max-Forwards: 70\r\n"
-            f"User-Agent: PySoftphone/1.0\r\n"
+            f"User-Agent: MyLineTelecom/1.0\r\n"
             f"Expires: 0\r\n"
             f"{auth_line}\r\n"
             f"Content-Length: 0\r\n"
@@ -747,7 +762,7 @@ class SipHandler(ProtocolHandler):
             f"CSeq: {self._reg_cseq} REGISTER\r\n"
             f"Contact: {self._contact_header()}\r\n"
             f"Max-Forwards: 70\r\n"
-            f"User-Agent: PySoftphone/1.0\r\n"
+            f"User-Agent: MyLineTelecom/1.0\r\n"
             f"Expires: 0\r\n"
             f"{auth_line}"
             f"Content-Length: 0\r\n"
@@ -792,7 +807,7 @@ class SipHandler(ProtocolHandler):
             f"CSeq: {self._call_cseq} INVITE\r\n"
             f"Contact: {self._contact_header()}\r\n"
             f"Max-Forwards: 70\r\n"
-            f"User-Agent: PySoftphone/1.0\r\n"
+            f"User-Agent: MyLineTelecom/1.0\r\n"
             f"Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, NOTIFY, REFER\r\n"
             f"Content-Type: application/sdp\r\n"
             f"Content-Length: {len(sdp_body)}\r\n"
@@ -827,7 +842,7 @@ class SipHandler(ProtocolHandler):
             f"CSeq: {self._call_cseq} INVITE\r\n"
             f"Contact: {self._contact_header()}\r\n"
             f"Max-Forwards: 70\r\n"
-            f"User-Agent: PySoftphone/1.0\r\n"
+            f"User-Agent: MyLineTelecom/1.0\r\n"
             f"Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, NOTIFY, REFER\r\n"
             f"{auth_line}\r\n"
             f"Content-Type: application/sdp\r\n"
@@ -840,8 +855,13 @@ class SipHandler(ProtocolHandler):
 
     def _send_ack(self, to_tag=""):
         """Send ACK for an INVITE transaction."""
+        self._send_ack_for_call(self._call_id, self._call_from_tag, to_tag,
+                                 self._call_remote_uri)
+
+    def _send_ack_for_call(self, call_id, from_tag, to_tag="", remote_uri=""):
+        """Send ACK for a specific call (used for held call re-INVITE too)."""
         server, port = self._server_addr
-        uri = self._call_remote_uri or f"sip:{server}:{port}"
+        uri = remote_uri or f"sip:{server}:{port}"
         from_uri = f'"{self._display_name}" <sip:{self._username}@{server}>'
         to_header = f"<{uri}>"
         if to_tag:
@@ -850,9 +870,9 @@ class SipHandler(ProtocolHandler):
         msg = (
             f"ACK {uri} SIP/2.0\r\n"
             f"Via: {self._via_header()}\r\n"
-            f"From: {from_uri};tag={self._call_from_tag}\r\n"
+            f"From: {from_uri};tag={from_tag}\r\n"
             f"To: {to_header}\r\n"
-            f"Call-ID: {self._call_id}\r\n"
+            f"Call-ID: {call_id}\r\n"
             f"CSeq: {self._call_cseq} ACK\r\n"
             f"Max-Forwards: 70\r\n"
             f"Content-Length: 0\r\n"
@@ -877,7 +897,7 @@ class SipHandler(ProtocolHandler):
             f"Call-ID: {self._call_id}\r\n"
             f"CSeq: {self._incoming_cseq} INVITE\r\n"
             f"Contact: {self._contact_header()}\r\n"
-            f"User-Agent: PySoftphone/1.0\r\n"
+            f"User-Agent: MyLineTelecom/1.0\r\n"
             f"Content-Type: application/sdp\r\n"
             f"Content-Length: {len(sdp_body)}\r\n"
             f"\r\n"
@@ -926,15 +946,107 @@ class SipHandler(ProtocolHandler):
         if self._rtp_session:
             self._rtp_session.send_dtmf(digit)
 
+    def _build_hold_sdp(self):
+        """Build SDP with a=sendonly for hold."""
+        sdp_ip = self._public_ip or self._local_ip
+        rtp_port = self._rtp_port or (self._local_port + 2)
+        sdp = (
+            "v=0\r\n"
+            f"o=pysoftphone 0 1 IN IP4 {sdp_ip}\r\n"
+            "s=MyLineTelecom\r\n"
+            f"c=IN IP4 {sdp_ip}\r\n"
+            "t=0 0\r\n"
+            f"m=audio {rtp_port} RTP/AVP 0 101\r\n"
+            "a=rtpmap:0 PCMU/8000\r\n"
+            "a=rtpmap:101 telephone-event/8000\r\n"
+            "a=fmtp:101 0-16\r\n"
+            "a=ptime:20\r\n"
+            "a=sendonly\r\n"
+        )
+        return sdp
+
+    def _build_unhold_sdp(self):
+        """Build SDP with a=sendrecv for unhold."""
+        sdp_ip = self._public_ip or self._local_ip
+        rtp_port = self._rtp_port or (self._local_port + 2)
+        sdp = (
+            "v=0\r\n"
+            f"o=pysoftphone 0 2 IN IP4 {sdp_ip}\r\n"
+            "s=MyLineTelecom\r\n"
+            f"c=IN IP4 {sdp_ip}\r\n"
+            "t=0 0\r\n"
+            f"m=audio {rtp_port} RTP/AVP 0 101\r\n"
+            "a=rtpmap:0 PCMU/8000\r\n"
+            "a=rtpmap:101 telephone-event/8000\r\n"
+            "a=fmtp:101 0-16\r\n"
+            "a=ptime:20\r\n"
+            "a=sendrecv\r\n"
+        )
+        return sdp
+
+    def _send_reinvite(self, sdp_body):
+        """Send a re-INVITE with the given SDP body (for hold/unhold)."""
+        if not self._call_id or not self._server_addr:
+            return
+        server, port = self._server_addr
+        self._call_cseq += 1
+        uri = self._call_remote_uri or f"sip:{server}"
+        from_uri = f'"{self._display_name}" <sip:{self._username}@{server}>'
+        to_header = f"<{uri}>"
+        if self._call_to_tag:
+            to_header += f";tag={self._call_to_tag}"
+
+        msg = (
+            f"INVITE {uri} SIP/2.0\r\n"
+            f"Via: {self._via_header()}\r\n"
+            f"From: {from_uri};tag={self._call_from_tag}\r\n"
+            f"To: {to_header}\r\n"
+            f"Call-ID: {self._call_id}\r\n"
+            f"CSeq: {self._call_cseq} INVITE\r\n"
+            f"Contact: {self._contact_header()}\r\n"
+            f"Max-Forwards: 70\r\n"
+            f"User-Agent: MyLineTelecom/1.0\r\n"
+            f"Content-Type: application/sdp\r\n"
+            f"Content-Length: {len(sdp_body)}\r\n"
+            f"\r\n"
+            f"{sdp_body}"
+        )
+        # Add cached auth if available
+        if self._auth_cached:
+            auth_line = self._build_cached_auth_header("INVITE", uri)
+            msg = msg.replace("Max-Forwards: 70\r\n",
+                              f"Max-Forwards: 70\r\n{auth_line}\r\n")
+        self._send_sip(msg)
+
     def hold_call(self):
+        """Put the current call on hold via re-INVITE with sendonly SDP."""
+        if self._hold_pending:
+            logger.debug("Hold re-INVITE already pending, ignoring")
+            return
+        self._on_hold = True
+        self._hold_pending = True
         if self._rtp_session:
             self._rtp_session.set_muted(True)
+        # Send re-INVITE with sendonly to tell server to play MOH
+        sdp = self._build_hold_sdp()
+        self._send_reinvite(sdp)
+        logger.info("SIP hold — re-INVITE with sendonly sent")
         if self._on_call_state_change:
             self._on_call_state_change("SIP", "HOLD", "")
 
     def unhold_call(self):
+        """Resume the current call via re-INVITE with sendrecv SDP."""
+        if self._hold_pending:
+            logger.debug("Hold re-INVITE already pending, ignoring")
+            return
+        self._on_hold = False
+        self._hold_pending = True
         if self._rtp_session:
             self._rtp_session.set_muted(False)
+        # Send re-INVITE with sendrecv to resume audio
+        sdp = self._build_unhold_sdp()
+        self._send_reinvite(sdp)
+        logger.info("SIP unhold — re-INVITE with sendrecv sent")
         if self._on_call_state_change:
             self._on_call_state_change("SIP", "CONFIRMED", "")
 
@@ -965,8 +1077,104 @@ class SipHandler(ProtocolHandler):
             f"Content-Length: 0\r\n"
             f"\r\n"
         )
+        # Add cached auth if available
+        if self._auth_cached:
+            auth_line = self._build_cached_auth_header("REFER", uri)
+            msg = msg.replace("Max-Forwards: 70\r\n",
+                              f"Max-Forwards: 70\r\n{auth_line}\r\n")
         self._send_sip(msg)
         logger.info("SIP REFER sent to transfer to %s", target)
+
+    # -- Attended transfer (consultation) ------------------------------------
+
+    def consultation_call(self, target: str):
+        """Save current call on hold and start a new consultation call."""
+        if not self._call_id or not self._server_addr:
+            return
+        server, _ = self._server_addr
+        # Save the current (held) call state
+        consult_uri = target if target.startswith("sip:") else f"sip:{target}@{server}"
+        self._held_call = {
+            "call_id": self._call_id,
+            "call_cseq": self._call_cseq,
+            "call_from_tag": self._call_from_tag,
+            "call_to_tag": self._call_to_tag,
+            "call_remote_uri": self._call_remote_uri,
+            "rtp_session": self._rtp_session,
+            "rtp_port": self._rtp_port,
+            "invite_auth_attempted": self._invite_auth_attempted,
+            "transfer_target": consult_uri,
+        }
+        # Clear call state for the new consultation call
+        self._rtp_session = None
+        self._hold_pending = False
+        # Use a different RTP port for the consultation call (offset from held call)
+        held_rtp = self._rtp_port
+        self._rtp_port = held_rtp + 2 if held_rtp else 0
+        self.in_call = False
+        self._call_id = ""
+        self._invite_auth_attempted = False
+        # Make the consultation call
+        self.make_call(target)
+        logger.info("Consultation call started to %s (original call on hold)", target)
+
+    def complete_attended_transfer(self):
+        """Complete attended transfer: REFER held call to consultation target, hang up consultation."""
+        if not self._held_call:
+            logger.warning("No held call to transfer")
+            return
+        transfer_target = self._held_call["transfer_target"]
+
+        # Hang up the consultation call
+        self.hangup_call()
+
+        # Restore the held call state
+        held = self._held_call
+        self._call_id = held["call_id"]
+        self._call_cseq = held["call_cseq"]
+        self._call_from_tag = held["call_from_tag"]
+        self._call_to_tag = held["call_to_tag"]
+        self._call_remote_uri = held["call_remote_uri"]
+        self._rtp_session = held["rtp_session"]
+        self._rtp_port = held["rtp_port"]
+        self.in_call = True
+
+        # Send REFER on the original call to transfer it to the consultation target
+        self.transfer_call(transfer_target)
+        logger.info("Attended transfer completed — REFER sent to %s", transfer_target)
+
+        # Clean up — the REFER will cause the server to bridge the calls
+        self._stop_rtp()
+        self.in_call = False
+        self._call_id = ""
+        self._held_call = None
+        self._on_hold = False
+        if self._on_call_state_change:
+            self._on_call_state_change("SIP", "DISCONNECTED", "Transfer completed")
+
+    def cancel_consultation(self):
+        """Cancel consultation call and resume the original held call."""
+        if not self._held_call:
+            logger.warning("No held call to resume")
+            return
+        # Hang up the consultation call
+        self.hangup_call()
+
+        # Restore the held call
+        held = self._held_call
+        self._call_id = held["call_id"]
+        self._call_cseq = held["call_cseq"]
+        self._call_from_tag = held["call_from_tag"]
+        self._call_to_tag = held["call_to_tag"]
+        self._call_remote_uri = held["call_remote_uri"]
+        self._rtp_session = held["rtp_session"]
+        self._rtp_port = held["rtp_port"]
+        self.in_call = True
+        self._held_call = None
+
+        # Unhold — resume audio
+        self.unhold_call()
+        logger.info("Consultation cancelled, original call resumed")
 
     def subscribe_blf(self, extension: str):
         """Subscribe to dialog event package for BLF."""
@@ -992,7 +1200,7 @@ class SipHandler(ProtocolHandler):
             f"CSeq: 1 SUBSCRIBE\r\n"
             f"Contact: {self._contact_header()}\r\n"
             f"Max-Forwards: 70\r\n"
-            f"User-Agent: PySoftphone/1.0\r\n"
+            f"User-Agent: MyLineTelecom/1.0\r\n"
             f"Event: dialog\r\n"
             f"Accept: application/dialog-info+xml\r\n"
             f"Expires: 3600\r\n"
@@ -1025,7 +1233,7 @@ class SipHandler(ProtocolHandler):
             f"CSeq: {sub['cseq']} SUBSCRIBE\r\n"
             f"Contact: {self._contact_header()}\r\n"
             f"Max-Forwards: 70\r\n"
-            f"User-Agent: PySoftphone/1.0\r\n"
+            f"User-Agent: MyLineTelecom/1.0\r\n"
             f"Event: dialog\r\n"
             f"Accept: application/dialog-info+xml\r\n"
             f"Expires: 3600\r\n"
@@ -1059,7 +1267,12 @@ class SipHandler(ProtocolHandler):
     def _start_rtp(self, remote_ip, remote_port):
         """Start RTP audio session."""
         self._stop_rtp()
-        self._rtp_session = RtpSession(self._rtp_port)
+        input_dev = self._audio_config.get("input_device", "")
+        output_dev = self._audio_config.get("output_device", "")
+        in_idx = int(input_dev) if input_dev not in ("", None) else None
+        out_idx = int(output_dev) if output_dev not in ("", None) else None
+        self._rtp_session = RtpSession(self._rtp_port, input_device=in_idx,
+                                        output_device=out_idx)
         actual_port = self._rtp_session.start(remote_ip, remote_port)
         self._rtp_port = actual_port
         logger.info("RTP session started: local=%d remote=%s:%d",
@@ -1106,13 +1319,23 @@ class SipHandler(ProtocolHandler):
         if "REGISTER" in cseq:
             self._handle_register_response(status_code, headers, body)
         elif "INVITE" in cseq:
-            # Only process INVITE responses for the current call
+            # Accept responses for the current call OR the held call (re-INVITE for hold/unhold)
+            held_call_id = self._held_call["call_id"] if self._held_call else ""
             if call_id and self._call_id and call_id != self._call_id:
+                if call_id == held_call_id and status_code == 200:
+                    # 200 OK for the held call's re-INVITE (hold) — just ACK it
+                    to_tag = self._extract_to_tag(headers)
+                    self._send_ack_for_call(call_id, self._held_call["call_from_tag"],
+                                            to_tag, self._held_call["call_remote_uri"])
+                    logger.debug("ACK sent for held call re-INVITE 200 OK")
+                    return
                 logger.debug("Ignoring INVITE response for old Call-ID %s", call_id)
                 return
             self._handle_invite_response(status_code, headers, body)
         elif "BYE" in cseq:
             logger.info("BYE response: %d", status_code)
+        elif "REFER" in cseq:
+            logger.info("REFER response: %d", status_code)
         elif "SUBSCRIBE" in cseq:
             self._handle_subscribe_response(status_code, headers, body, call_id)
         elif "OPTIONS" in cseq:
@@ -1220,9 +1443,15 @@ class SipHandler(ProtocolHandler):
             # Send ACK (always, even for retransmitted 200s)
             self._send_ack(self._call_to_tag)
 
-            # Only start RTP on first 200 OK (ignore retransmissions or late 200s after BYE)
-            if self._rtp_session or not self.in_call:
-                logger.debug("Ignoring retransmitted 200 OK (RTP already active or call ended)")
+            # Re-INVITE 200 OK (hold/unhold) — RTP already exists, just ACK
+            if self._rtp_session and self.in_call:
+                self._hold_pending = False
+                logger.debug("Re-INVITE 200 OK acknowledged (hold/unhold)")
+                return
+
+            # Late 200 OK after BYE — ignore
+            if not self.in_call:
+                logger.debug("Ignoring late 200 OK (call ended)")
                 return
 
             # Parse SDP for remote RTP address
@@ -1268,28 +1497,42 @@ class SipHandler(ProtocolHandler):
         elif status_code == 486 or status_code == 600:
             to_tag = self._extract_to_tag(headers)
             self._send_ack(to_tag)
-            self.in_call = False
-            self._call_id = ""
-            if self._on_call_state_change:
-                self._on_call_state_change("SIP", "BUSY", "Busy")
+            if self._rtp_session:
+                # Re-INVITE error (hold/unhold) — don't kill the call
+                self._hold_pending = False
+                logger.warning("Re-INVITE rejected: %d (call continues)", status_code)
+            else:
+                self.in_call = False
+                self._call_id = ""
+                if self._on_call_state_change:
+                    self._on_call_state_change("SIP", "BUSY", "Busy")
 
         elif status_code == 503:
             to_tag = self._extract_to_tag(headers)
             self._send_ack(to_tag)
-            self.in_call = False
-            self._call_id = ""
-            logger.warning("SIP 503 Service Unavailable — destination unreachable")
-            if self._on_call_state_change:
-                self._on_call_state_change("SIP", "REJECTED", "503 Service Unavailable")
+            if self._rtp_session:
+                self._hold_pending = False
+                logger.warning("Re-INVITE 503 (call continues)")
+            else:
+                self.in_call = False
+                self._call_id = ""
+                logger.warning("SIP 503 Service Unavailable — destination unreachable")
+                if self._on_call_state_change:
+                    self._on_call_state_change("SIP", "REJECTED", "503 Service Unavailable")
 
         elif status_code >= 400:
             to_tag = self._extract_to_tag(headers)
             self._send_ack(to_tag)
-            self.in_call = False
-            self._call_id = ""
-            logger.warning("SIP INVITE rejected: %d", status_code)
-            if self._on_call_state_change:
-                self._on_call_state_change("SIP", "REJECTED", str(status_code))
+            if self._rtp_session:
+                # Re-INVITE error (hold/unhold) — don't kill the call
+                self._hold_pending = False
+                logger.warning("Re-INVITE rejected: %d (call continues)", status_code)
+            else:
+                self.in_call = False
+                self._call_id = ""
+                logger.warning("SIP INVITE rejected: %d", status_code)
+                if self._on_call_state_change:
+                    self._on_call_state_change("SIP", "REJECTED", str(status_code))
 
     def _handle_subscribe_response(self, status_code, headers, body, call_id):
         """Handle responses to SUBSCRIBE requests (BLF)."""
@@ -1386,7 +1629,7 @@ class SipHandler(ProtocolHandler):
                 f"To: {to_header}\r\n"
                 f"Call-ID: {call_id}\r\n"
                 f"CSeq: {cseq}\r\n"
-                f"User-Agent: PySoftphone/1.0\r\n"
+                f"User-Agent: MyLineTelecom/1.0\r\n"
                 f"Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, NOTIFY, REFER\r\n"
                 f"Content-Length: 0\r\n"
                 f"\r\n"
@@ -1536,7 +1779,7 @@ class SipHandler(ProtocolHandler):
             f"CSeq: 1 OPTIONS\r\n"
             f"Contact: {self._contact_header()}\r\n"
             f"Max-Forwards: 70\r\n"
-            f"User-Agent: PySoftphone/1.0\r\n"
+            f"User-Agent: MyLineTelecom/1.0\r\n"
             f"Content-Length: 0\r\n"
             f"\r\n"
         )

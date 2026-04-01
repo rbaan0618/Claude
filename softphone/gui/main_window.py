@@ -14,7 +14,6 @@ from gui.contacts_panel import ContactsPanel
 from gui.call_history import CallHistoryPanel
 from gui.settings_dialog import SettingsDialog
 from protocols.sip_handler import SipHandler
-from protocols.iax_handler import IaxHandler
 from models.call_record import CallRecord
 from utils.database import add_call_record
 from config import load_config, save_config
@@ -30,10 +29,8 @@ class MainWindow:
         self.theme_name = self.config.get("gui", {}).get("theme", "dark")
         self.colors = get_theme(self.theme_name)
 
-        # Protocol handlers
+        # Protocol handler
         self.sip = SipHandler()
-        self.iax = IaxHandler()
-        self.active_protocol = "SIP"  # or "IAX"
 
         # Call state
         self._current_call = None
@@ -41,6 +38,11 @@ class MainWindow:
         self._call_start_time = None
         self._ringing = False
         self._ring_type = "ringback"  # "ringback" for outbound, "incoming" for inbound
+
+        # Attended transfer state
+        self._transfer_in_progress = False
+        self._transfer_target = None
+        self._transfer_dialog = None
 
         self._build_window()
         self._setup_protocols()
@@ -50,7 +52,7 @@ class MainWindow:
         c = self.colors
 
         self.root = tk.Tk()
-        self.root.title("PySoftphone")
+        self.root.title("My Line Telecom Softphone")
         self.root.geometry("820x640")
         self.root.configure(bg=c["bg"])
         self.root.minsize(700, 500)
@@ -63,22 +65,11 @@ class MainWindow:
         top_bar.pack(fill=tk.X)
         top_bar.pack_propagate(False)
 
-        tk.Label(top_bar, text="PySoftphone", font=("Segoe UI", 11, "bold"),
+        tk.Label(top_bar, text="My Line Telecom", font=("Segoe UI", 11, "bold"),
                  bg=c["status_bar"], fg=c["accent"]).pack(side=tk.LEFT, padx=10)
 
-        # Protocol selector
-        proto_frame = tk.Frame(top_bar, bg=c["status_bar"])
-        proto_frame.pack(side=tk.LEFT, padx=20)
-
-        self._proto_buttons = {}
-        for proto in ["SIP", "IAX"]:
-            btn = tk.Label(proto_frame, text=proto, font=("Segoe UI", 9, "bold"),
-                           padx=10, pady=2, cursor="hand2",
-                           bg=c["accent"] if proto == self.active_protocol else c["status_bar"],
-                           fg="#ffffff" if proto == self.active_protocol else c["fg_dim"])
-            btn.pack(side=tk.LEFT, padx=2)
-            btn.bind("<Button-1>", lambda e, p=proto: self._switch_protocol(p))
-            self._proto_buttons[proto] = btn
+        tk.Label(top_bar, text="SIP", font=("Segoe UI", 9, "bold"),
+                 padx=10, pady=2, bg=c["accent"], fg="#ffffff").pack(side=tk.LEFT, padx=20)
 
         # Registration status
         self.reg_status_var = tk.StringVar(value="Not registered")
@@ -199,9 +190,9 @@ class MainWindow:
     # ---- Protocol setup ----
 
     def _setup_protocols(self):
-        """Initialize protocol handlers and set callbacks."""
+        """Initialize SIP protocol handler and set callbacks."""
         sip_config = self.config.get("sip", {})
-        iax_config = self.config.get("iax", {})
+        audio_config = self.config.get("audio", {})
 
         self.sip.set_callbacks(
             on_incoming_call=self._on_incoming_call,
@@ -209,56 +200,29 @@ class MainWindow:
             on_registration_state=self._on_registration_state,
             on_blf_state_change=self._on_blf_state_change,
         )
-        self.iax.set_callbacks(
-            on_incoming_call=self._on_incoming_call,
-            on_call_state_change=self._on_call_state_change,
-            on_registration_state=self._on_registration_state,
-            on_blf_state_change=self._on_blf_state_change,
-        )
 
         if sip_config.get("enabled", True):
-            self.sip.initialize(sip_config)
-        if iax_config.get("enabled", False):
-            self.iax.initialize(iax_config)
+            self.sip.initialize(sip_config, audio_config)
 
     def _auto_register(self):
-        """Auto-register if credentials are configured."""
-        for proto_name, handler, cfg_key in [("SIP", self.sip, "sip"), ("IAX", self.iax, "iax")]:
-            cfg = self.config.get(cfg_key, {})
-            if cfg.get("enabled") and cfg.get("server") and cfg.get("username"):
-                threading.Thread(
-                    target=handler.register,
-                    args=(cfg["server"], cfg["username"],
-                          cfg.get("password", ""), cfg.get("port", 5060)),
-                    daemon=True
-                ).start()
+        """Auto-register if SIP credentials are configured."""
+        cfg = self.config.get("sip", {})
+        if cfg.get("enabled") and cfg.get("server") and cfg.get("username"):
+            threading.Thread(
+                target=self.sip.register,
+                args=(cfg["server"], cfg["username"],
+                      cfg.get("password", ""), cfg.get("port", 5060)),
+                daemon=True
+            ).start()
 
     def _active_handler(self):
-        return self.sip if self.active_protocol == "SIP" else self.iax
-
-    # ---- Protocol switching ----
-
-    def _switch_protocol(self, proto):
-        if proto == self.active_protocol:
-            return
-        c = self.colors
-        self._proto_buttons[self.active_protocol].configure(
-            bg=c["status_bar"], fg=c["fg_dim"])
-        self.active_protocol = proto
-        self._proto_buttons[proto].configure(bg=c["accent"], fg="#ffffff")
-        handler = self._active_handler()
-        if handler.registered:
-            self.reg_status_var.set(f"{proto}: Registered")
-        else:
-            self.reg_status_var.set(f"{proto}: Not registered")
-        self.status_var.set(f"Switched to {proto}")
+        return self.sip
 
     # ---- Registration ----
 
     def _toggle_registration(self):
         handler = self._active_handler()
-        cfg_key = self.active_protocol.lower()
-        cfg = self.config.get(cfg_key, {})
+        cfg = self.config.get("sip", {})
 
         if handler.registered:
             handler.unregister()
@@ -284,11 +248,11 @@ class MainWindow:
 
         self._current_call = CallRecord(
             direction="outbound",
-            protocol=self.active_protocol,
+            protocol="SIP",
             remote_number=number,
         )
         if handler.make_call(number):
-            self.status_var.set(f"Calling {number} via {self.active_protocol}...")
+            self.status_var.set(f"Calling {number}...")
             self.dialpad.caller_info_var.set(f"Calling: {number}")
         else:
             self._current_call.status = "failed"
@@ -324,23 +288,40 @@ class MainWindow:
 
     def _hold(self):
         handler = self._active_handler()
-        handler.hold_call()
-        self.status_var.set("Call on hold")
+        if self._transfer_in_progress:
+            # Cancel transfer and resume original call
+            self._cancel_transfer()
+            self.dialpad.set_hold_active(False)
+            return
+        if handler.on_hold:
+            handler.unhold_call()
+            self.dialpad.set_hold_active(False)
+            self.status_var.set("Call resumed")
+        else:
+            handler.hold_call()
+            self.dialpad.set_hold_active(True)
+            self.status_var.set("Call on hold")
 
     def _transfer(self):
-        """Show transfer dialog and execute blind transfer."""
+        """Attended transfer: hold current call, dial target, then complete or cancel."""
         handler = self._active_handler()
         if not handler.in_call:
             self.status_var.set("Not in a call")
             return
 
+        # If we're already in the consultation call, complete the transfer
+        if self._transfer_in_progress:
+            self._complete_transfer()
+            return
+
         c = self.colors
         dialog = tk.Toplevel(self.root)
         dialog.title("Transfer Call")
-        dialog.geometry("300x140")
+        dialog.geometry("320x180")
         dialog.configure(bg=c["bg"])
         dialog.transient(self.root)
         dialog.grab_set()
+        self._transfer_dialog = dialog
 
         tk.Label(dialog, text="Transfer to:", bg=c["bg"], fg=c["fg"],
                  font=("Segoe UI", 11)).pack(anchor=tk.W, padx=15, pady=(15, 2))
@@ -353,27 +334,62 @@ class MainWindow:
         entry.focus_set()
         entry.select_range(0, tk.END)
 
-        def _do_transfer():
-            number = target_var.get().strip()
-            if number:
-                handler.transfer_call(number)
-                self.status_var.set(f"Transferring to {number}...")
-                dialog.destroy()
+        tk.Label(dialog, text="The current call will be placed on hold.\n"
+                 "Dial the target, then complete or cancel the transfer.",
+                 bg=c["bg"], fg=c["fg_dim"], font=("Segoe UI", 8),
+                 justify=tk.LEFT).pack(anchor=tk.W, padx=15, pady=(5, 0))
 
-        entry.bind("<Return>", lambda e: _do_transfer())
+        def _start_consultation():
+            number = target_var.get().strip()
+            if not number:
+                return
+            self._transfer_target = number
+            # Hold the current call and start consultation
+            handler.hold_call()
+            self._transfer_in_progress = True
+            handler.consultation_call(number)
+            self.status_var.set(f"Consulting {number}... (original call on hold)")
+            self.dialpad.caller_info_var.set(f"Consulting: {number}")
+            dialog.destroy()
+
+        entry.bind("<Return>", lambda e: _start_consultation())
 
         btn_frame = tk.Frame(dialog, bg=c["bg"])
         btn_frame.pack(fill=tk.X, padx=15, pady=10)
 
-        tk.Button(btn_frame, text="Transfer", command=_do_transfer,
+        tk.Button(btn_frame, text="Call", command=_start_consultation,
                   bg=c["accent"], fg="#ffffff", font=("Segoe UI", 10, "bold"),
                   relief=tk.FLAT, padx=20, pady=4).pack(side=tk.LEFT)
         tk.Button(btn_frame, text="Cancel", command=dialog.destroy,
                   bg=c["button_bg"], fg=c["button_fg"], font=("Segoe UI", 10),
                   relief=tk.FLAT, padx=20, pady=4).pack(side=tk.LEFT, padx=(8, 0))
 
+    def _complete_transfer(self):
+        """Complete the attended transfer — REFER the held call to the consultation target."""
+        handler = self._active_handler()
+        handler.complete_attended_transfer()
+        self._transfer_in_progress = False
+        self._transfer_target = None
+        self.status_var.set("Transfer completed")
+        self.dialpad.caller_info_var.set("")
+
+    def _cancel_transfer(self):
+        """Cancel transfer — hang up consultation call, resume original call."""
+        handler = self._active_handler()
+        handler.cancel_consultation()
+        self._transfer_in_progress = False
+        self._transfer_target = None
+        self.status_var.set("Transfer cancelled — call resumed")
+        self.dialpad.caller_info_var.set("Connected")
+
     def _mute(self):
-        self.status_var.set("Mute toggled")
+        handler = self._active_handler()
+        if not handler.in_call or not handler._rtp_session:
+            return
+        muted = not handler._rtp_session._muted
+        handler._rtp_session.set_muted(muted)
+        self.dialpad.set_mute_active(muted)
+        self.status_var.set("Microphone muted" if muted else "Microphone unmuted")
 
     # ---- Callbacks from protocol handlers (called from background threads) ----
 
@@ -397,6 +413,12 @@ class MainWindow:
         def _update():
             if state == "CONFIRMED":
                 self._stop_ringtone()
+                if self._transfer_in_progress:
+                    # Consultation call answered — show transfer controls
+                    self.status_var.set("Consultation connected — Transfer or Hold to cancel")
+                    self.dialpad.caller_info_var.set(
+                        f"Consulting: {self._transfer_target}\n(Transfer=complete, Hold=cancel)")
+                    return
                 if self._current_call:
                     self._current_call.answer()
                 self._start_call_timer()
@@ -404,6 +426,10 @@ class MainWindow:
                 self.dialpad.caller_info_var.set("Connected")
             elif state == "DISCONNECTED":
                 self._stop_ringtone()
+                if self._transfer_in_progress:
+                    # Consultation call ended (target didn't answer or hung up)
+                    self._cancel_transfer()
+                    return
                 self._stop_call_timer()
                 if self._current_call:
                     self._current_call.end()
@@ -412,6 +438,8 @@ class MainWindow:
                 self.dialpad.hide_incoming()
                 self.dialpad.caller_info_var.set("")
                 self.dialpad.timer_var.set("")
+                self.dialpad.set_mute_active(False)
+                self.dialpad.set_hold_active(False)
                 self.status_var.set(f"Call ended: {reason}")
             elif state == "RINGING":
                 self._start_ringtone("ringback")
@@ -441,9 +469,8 @@ class MainWindow:
                 self.status_var.set(f"{protocol} registered successfully")
 
                 # Subscribe BLF entries
-                handler = self.sip if protocol == "SIP" else self.iax
                 for entry in self.blf_panel.get_entries():
-                    handler.subscribe_blf(entry["extension"])
+                    self.sip.subscribe_blf(entry["extension"])
             else:
                 self.reg_status_var.set(f"{protocol}: Not registered")
                 self.reg_status.configure(fg=c["red"])
@@ -607,7 +634,6 @@ class MainWindow:
         self._save_contacts()
         self._save_blf()
         self.sip.shutdown()
-        self.iax.shutdown()
         self.root.destroy()
 
     def run(self):
