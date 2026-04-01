@@ -372,6 +372,8 @@ class SipHandler(ProtocolHandler):
         self._call_from_tag = ""
         self._call_to_tag = ""
         self._call_remote_uri = ""
+        self._call_remote_tag = ""  # The remote party's tag (From tag for incoming calls)
+        self._call_direction = ""   # "outbound" or "inbound"
         self._call_remote_target = ""
         self._call_route_set = []
         self._invite_auth_attempted = False  # True after we've sent one auth'd INVITE
@@ -786,10 +788,12 @@ class SipHandler(ProtocolHandler):
         if not uri.startswith("sip:"):
             uri = f"sip:{uri}@{server}"
         self._call_remote_uri = uri
+        self._call_direction = "outbound"
 
         self._call_id = _generate_call_id()
         self._call_from_tag = _generate_tag()
         self._call_to_tag = ""
+        self._call_remote_tag = ""
         self._call_cseq = 1
         self._invite_auth_attempted = False
 
@@ -919,16 +923,23 @@ class SipHandler(ProtocolHandler):
         server, port = self._server_addr
         self._call_cseq += 1
         uri = self._call_remote_uri or f"sip:{server}"
-        from_uri = f'"{self._display_name}" <sip:{self._username}@{server}>'
-        to_header = f"<{uri}>"
-        if self._call_to_tag:
-            to_header += f";tag={self._call_to_tag}"
+
+        if self._call_direction == "inbound":
+            from_line = f'"{self._display_name}" <sip:{self._username}@{server}>;tag={self._call_from_tag}'
+            to_line = self._incoming_from
+            if self._call_remote_tag and "tag=" not in to_line:
+                to_line += f";tag={self._call_remote_tag}"
+        else:
+            from_line = f'"{self._display_name}" <sip:{self._username}@{server}>;tag={self._call_from_tag}'
+            to_line = f"<{uri}>"
+            if self._call_to_tag:
+                to_line += f";tag={self._call_to_tag}"
 
         msg = (
             f"BYE {uri} SIP/2.0\r\n"
             f"Via: {self._via_header()}\r\n"
-            f"From: {from_uri};tag={self._call_from_tag}\r\n"
-            f"To: {to_header}\r\n"
+            f"From: {from_line}\r\n"
+            f"To: {to_line}\r\n"
             f"Call-ID: {self._call_id}\r\n"
             f"CSeq: {self._call_cseq} BYE\r\n"
             f"Max-Forwards: 70\r\n"
@@ -991,16 +1002,27 @@ class SipHandler(ProtocolHandler):
         server, port = self._server_addr
         self._call_cseq += 1
         uri = self._call_remote_uri or f"sip:{server}"
-        from_uri = f'"{self._display_name}" <sip:{self._username}@{server}>'
-        to_header = f"<{uri}>"
-        if self._call_to_tag:
-            to_header += f";tag={self._call_to_tag}"
+
+        if self._call_direction == "inbound":
+            # For incoming calls: we are the callee
+            # From = us (with our tag), To = remote (with remote's tag)
+            from_line = f'"{self._display_name}" <sip:{self._username}@{server}>;tag={self._call_from_tag}'
+            to_line = f"{self._incoming_from}"
+            # Ensure remote tag is in To header
+            if self._call_remote_tag and "tag=" not in to_line:
+                to_line += f";tag={self._call_remote_tag}"
+        else:
+            # For outgoing calls: we are the caller
+            from_line = f'"{self._display_name}" <sip:{self._username}@{server}>;tag={self._call_from_tag}'
+            to_line = f"<{uri}>"
+            if self._call_to_tag:
+                to_line += f";tag={self._call_to_tag}"
 
         msg = (
             f"INVITE {uri} SIP/2.0\r\n"
             f"Via: {self._via_header()}\r\n"
-            f"From: {from_uri};tag={self._call_from_tag}\r\n"
-            f"To: {to_header}\r\n"
+            f"From: {from_line}\r\n"
+            f"To: {to_line}\r\n"
             f"Call-ID: {self._call_id}\r\n"
             f"CSeq: {self._call_cseq} INVITE\r\n"
             f"Contact: {self._contact_header()}\r\n"
@@ -1581,7 +1603,11 @@ class SipHandler(ProtocolHandler):
         cseq = headers.get("cseq", "")
 
         if method == "INVITE":
-            self._handle_incoming_invite(headers, body, addr)
+            if self.in_call and call_id == self._call_id:
+                # Re-INVITE on existing call (hold update from remote, session refresh, etc.)
+                self._handle_incoming_reinvite(headers, body, addr)
+            else:
+                self._handle_incoming_invite(headers, body, addr)
 
         elif method == "BYE":
             # Remote hangup
@@ -1657,6 +1683,45 @@ class SipHandler(ProtocolHandler):
             if self._on_call_state_change:
                 self._on_call_state_change("SIP", "DISCONNECTED", "Cancelled")
 
+    def _handle_incoming_reinvite(self, headers, body, addr):
+        """Handle re-INVITE on an existing call (session refresh, hold update from remote)."""
+        call_id = headers.get("call-id", "")
+        from_header = headers.get("from", "")
+        to_header = headers.get("to", "")
+        via_header = headers.get("via", "")
+        if isinstance(via_header, list):
+            via_header = "\r\nVia: ".join(via_header)
+        cseq_header = headers.get("cseq", "")
+        cseq_num = re.match(r"(\d+)", cseq_header).group(1) if cseq_header else "1"
+
+        # Update remote SDP if provided
+        if body:
+            rtp_ip, rtp_port = self._parse_sdp(body)
+            if rtp_ip and rtp_port and self._rtp_session:
+                self._rtp_session._remote_addr = (rtp_ip, rtp_port)
+                logger.info("Re-INVITE: updated remote RTP to %s:%d", rtp_ip, rtp_port)
+
+        # Respond with 200 OK and our current SDP
+        server, port = self._server_addr
+        sdp_body = self._build_hold_sdp() if self._on_hold else self._build_unhold_sdp()
+
+        response = (
+            f"SIP/2.0 200 OK\r\n"
+            f"Via: {via_header}\r\n"
+            f"From: {from_header}\r\n"
+            f"To: {to_header}\r\n"
+            f"Call-ID: {call_id}\r\n"
+            f"CSeq: {cseq_num} INVITE\r\n"
+            f"Contact: {self._contact_header()}\r\n"
+            f"User-Agent: MyLineTelecom/1.0\r\n"
+            f"Content-Type: application/sdp\r\n"
+            f"Content-Length: {len(sdp_body)}\r\n"
+            f"\r\n"
+            f"{sdp_body}"
+        )
+        self._send_sip(response)
+        logger.info("Re-INVITE 200 OK sent (session refresh/hold update)")
+
     def _handle_incoming_invite(self, headers, body, addr):
         """Handle incoming INVITE."""
         call_id = headers.get("call-id", "")
@@ -1668,10 +1733,16 @@ class SipHandler(ProtocolHandler):
 
         # Store for answer
         self._call_id = call_id
+        self._call_direction = "inbound"
         self._incoming_via = via_header
         self._incoming_from = from_header
         self._incoming_cseq = re.match(r"(\d+)", cseq_header).group(1) if cseq_header else "1"
         self._call_from_tag = _generate_tag()
+        self._call_cseq = 1  # Our CSeq for re-INVITEs we send
+
+        # Extract remote's tag from From header
+        remote_tag_match = re.search(r'tag=([^;>\s]+)', from_header)
+        self._call_remote_tag = remote_tag_match.group(1) if remote_tag_match else ""
 
         # Extract caller info from From header
         name_match = re.match(r'"([^"]*)"', from_header)
