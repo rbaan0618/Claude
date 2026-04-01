@@ -145,10 +145,13 @@ class CallHistoryPanel(tk.Frame):
                      font=("Segoe UI", 8), bg=c["bg"],
                      fg=c["fg_dim"]).pack(anchor=tk.E)
 
-        # Click to redial
-        for w in (frame, info):
-            w.bind("<Button-1>",
-                   lambda e, n=number: self._redial(n))
+        # Click to redial — bind frame and ALL child widgets
+        def _bind_redial(widget, number):
+            widget.bind("<Button-1>", lambda e, n=number: self._redial(n))
+            for child in widget.winfo_children():
+                _bind_redial(child, number)
+
+        _bind_redial(frame, number)
 
         # Right-click to delete
         frame.bind("<Button-3>",

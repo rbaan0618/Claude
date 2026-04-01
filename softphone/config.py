@@ -29,6 +29,9 @@ DEFAULT_CONFIG = {
         "output_device": "",
         "ring_device": "",
     },
+    "contacts": {
+        "entries": [],
+    },
     "blf": {
         "entries": [],
     },

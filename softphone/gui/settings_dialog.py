@@ -96,6 +96,23 @@ class SettingsDialog(tk.Toplevel):
         tk.Entry(parent, **entry_kwargs).pack(fill=tk.X)
         return var
 
+    def _server_field(self, parent, label, key):
+        """Create a server field with auto-domain hint."""
+        c = self.colors
+        tk.Label(parent, text=label, bg=c["bg"], fg=c["fg"],
+                 font=("Segoe UI", 10)).pack(anchor=tk.W, pady=(8, 2))
+        row = tk.Frame(parent, bg=c["bg"])
+        row.pack(fill=tk.X)
+        var = tk.StringVar()
+        self._vars[key] = var
+        entry = tk.Entry(row, textvariable=var, bg=c["bg_input"], fg=c["fg"],
+                         font=("Segoe UI", 11), relief=tk.FLAT, bd=4,
+                         insertbackground=c["fg"])
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(row, text=".myline.tel", bg=c["bg"], fg=c["fg_dim"],
+                 font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(2, 0))
+        return var
+
     def _checkbox(self, parent, label, key):
         c = self.colors
         var = tk.BooleanVar()
@@ -110,7 +127,7 @@ class SettingsDialog(tk.Toplevel):
     def _build_sip_tab(self):
         f = self._tab_frames["SIP"]
         self._checkbox(f, "Enable SIP", "sip.enabled")
-        self._field(f, "Server:", "sip.server")
+        self._server_field(f, "Server:", "sip.server")
         self._field(f, "Port:", "sip.port")
         self._field(f, "Local Port:", "sip.local_port")
         self._checkbox(f, "Enable rport (RFC 3581 NAT traversal)", "sip.rport")
@@ -134,7 +151,7 @@ class SettingsDialog(tk.Toplevel):
     def _build_iax_tab(self):
         f = self._tab_frames["IAX"]
         self._checkbox(f, "Enable IAX", "iax.enabled")
-        self._field(f, "Server:", "iax.server")
+        self._server_field(f, "Server:", "iax.server")
         self._field(f, "Port:", "iax.port")
         self._field(f, "Local Port:", "iax.local_port")
         self._field(f, "Username:", "iax.username")
@@ -185,7 +202,11 @@ class SettingsDialog(tk.Toplevel):
             if isinstance(var, tk.BooleanVar):
                 var.set(bool(value))
             else:
-                var.set(str(value))
+                # Strip .myline.tel suffix for server fields display
+                s = str(value)
+                if parts[-1] == "server" and s.endswith(".myline.tel"):
+                    s = s[:-len(".myline.tel")]
+                var.set(s)
 
     def _save(self):
         """Write field values back to config and close."""
@@ -195,8 +216,13 @@ class SettingsDialog(tk.Toplevel):
             for p in parts[:-1]:
                 target = target.setdefault(p, {})
             value = var.get()
+            # Auto-append .myline.tel for server fields without a dot
+            if parts[-1] == "server" and isinstance(value, str) and value.strip():
+                value = value.strip()
+                if "." not in value:
+                    value = value + ".myline.tel"
             # Convert port fields to int
-            if parts[-1] in ("port", "local_port"):
+            elif parts[-1] in ("port", "local_port"):
                 try:
                     value = int(value)
                 except ValueError:

@@ -43,6 +43,89 @@ def _generate_call_id():
     return f"{random.randint(10000000, 99999999)}@pysoftphone"
 
 
+# ---------------------------------------------------------------------------
+# Minimal STUN client (RFC 5389) for public IP/port discovery
+# ---------------------------------------------------------------------------
+STUN_SERVERS = [
+    ("stun.l.google.com", 19302),
+    ("stun1.l.google.com", 19302),
+    ("stun.ekiga.net", 3478),
+    ("stun.ideasip.com", 3478),
+]
+
+STUN_BINDING_REQUEST = 0x0001
+STUN_BINDING_RESPONSE = 0x0101
+STUN_ATTR_MAPPED_ADDRESS = 0x0001
+STUN_ATTR_XOR_MAPPED_ADDRESS = 0x0020
+STUN_MAGIC_COOKIE = 0x2112A442
+
+
+def stun_discover(local_sock=None, timeout=3):
+    """Discover public IP and port via STUN. Returns (public_ip, public_port) or None."""
+    own_sock = False
+    if local_sock is None:
+        local_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        local_sock.bind(("", 0))
+        own_sock = True
+
+    old_timeout = local_sock.gettimeout()
+    local_sock.settimeout(timeout)
+
+    # Build STUN Binding Request
+    txn_id = struct.pack("!III", random.getrandbits(32),
+                         random.getrandbits(32), random.getrandbits(32))
+    header = struct.pack("!HHI", STUN_BINDING_REQUEST, 0, STUN_MAGIC_COOKIE) + txn_id
+
+    result = None
+    for stun_server in STUN_SERVERS:
+        try:
+            local_sock.sendto(header, stun_server)
+            data, addr = local_sock.recvfrom(1024)
+            if len(data) < 20:
+                continue
+
+            # Parse response header
+            msg_type, msg_len, magic = struct.unpack("!HHI", data[:8])
+            if msg_type != STUN_BINDING_RESPONSE:
+                continue
+
+            # Parse attributes
+            pos = 20
+            while pos + 4 <= len(data):
+                attr_type, attr_len = struct.unpack("!HH", data[pos:pos+4])
+                attr_data = data[pos+4:pos+4+attr_len]
+
+                if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS and attr_len >= 8:
+                    family = attr_data[1]
+                    if family == 0x01:  # IPv4
+                        xport = struct.unpack("!H", attr_data[2:4])[0] ^ (STUN_MAGIC_COOKIE >> 16)
+                        xip_int = struct.unpack("!I", attr_data[4:8])[0] ^ STUN_MAGIC_COOKIE
+                        xip = socket.inet_ntoa(struct.pack("!I", xip_int))
+                        result = (xip, xport)
+                        break
+
+                elif attr_type == STUN_ATTR_MAPPED_ADDRESS and attr_len >= 8:
+                    family = attr_data[1]
+                    if family == 0x01:
+                        port = struct.unpack("!H", attr_data[2:4])[0]
+                        ip = socket.inet_ntoa(attr_data[4:8])
+                        result = (ip, port)
+                        # Don't break — prefer XOR-MAPPED if found later
+
+                # Align to 4-byte boundary
+                pos += 4 + ((attr_len + 3) & ~3)
+
+            if result:
+                break
+        except (socket.timeout, OSError):
+            continue
+
+    local_sock.settimeout(old_timeout)
+    if own_sock:
+        local_sock.close()
+    return result
+
+
 class RtpSession:
     """Handles RTP audio send/receive using pyaudio."""
 
@@ -258,12 +341,25 @@ class SipHandler(ProtocolHandler):
         self._use_rport = True
         self._recv_thread: Optional[threading.Thread] = None
         self._running = False
+        # NAT traversal — public IP/port discovered via STUN or Via rport
+        self._public_ip = ""
+        self._public_port = 0
+        self._nat_detected = False
+        # Authentication cache (reuse across REGISTER/INVITE)
+        self._auth_realm = ""
+        self._auth_nonce = ""
+        self._auth_qop = ""
+        self._auth_nc = 0
+        self._auth_cached = False
         # Registration state
         self._reg_call_id = ""
         self._reg_cseq = 0
         self._reg_from_tag = ""
         self._reg_expires = 120
         self._reg_timer: Optional[threading.Timer] = None
+        self._keepalive_timer: Optional[threading.Timer] = None
+        self._keepalive_interval = 15  # seconds
+        self._unregistering = False
         # Call state
         self._call_id = ""
         self._call_cseq = 0
@@ -272,6 +368,8 @@ class SipHandler(ProtocolHandler):
         self._call_remote_uri = ""
         self._call_remote_target = ""
         self._call_route_set = []
+        self._invite_auth_attempted = False  # True after we've sent one auth'd INVITE
+        self._cached_sdp = ""   # Cached SDP body for INVITE re-send with auth
         self._rtp_session: Optional[RtpSession] = None
         self._rtp_port = 0
         # BLF
@@ -300,6 +398,9 @@ class SipHandler(ProtocolHandler):
         return via
 
     def _contact_header(self):
+        # Use local IP — let the server handle NAT rewriting via rport.
+        # Asterisk with nat=force_rport,comedia rewrites Contact itself;
+        # putting a STUN public IP here confuses many servers.
         return f"<sip:{self._username}@{self._local_ip}:{self._local_port}>"
 
     def _send_sip(self, message):
@@ -308,7 +409,11 @@ class SipHandler(ProtocolHandler):
             data = message.encode("utf-8")
             try:
                 self._sock.sendto(data, self._server_addr)
-                logger.debug("SIP TX:\n%s", message[:200])
+                # Log full message for debugging
+                first_line = message.split("\r\n", 1)[0]
+                logger.debug("SIP TX >>> %s:%d (%d bytes)\n%s",
+                             self._server_addr[0], self._server_addr[1],
+                             len(data), message.rstrip())
             except OSError as e:
                 logger.error("SIP send error: %s", e)
 
@@ -355,23 +460,73 @@ class SipHandler(ProtocolHandler):
                 params[match.group(1)] = match.group(2)
         return params
 
-    def _make_digest_response(self, method, uri, realm, nonce, username, password):
+    def _make_digest_response(self, method, uri, realm, nonce, username, password,
+                               qop=None, cnonce=None, nc=None):
         """Compute SIP digest authentication response (RFC 2617)."""
         ha1 = hashlib.md5(f"{username}:{realm}:{password}".encode()).hexdigest()
         ha2 = hashlib.md5(f"{method}:{uri}".encode()).hexdigest()
-        response = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
+        if qop == "auth" and cnonce and nc:
+            response = hashlib.md5(
+                f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}".encode()).hexdigest()
+        else:
+            response = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
         return response
 
     def _build_auth_header(self, method, uri, auth_header, header_name="Authorization"):
-        """Build a Digest authorization header."""
+        """Build a Digest authorization header and cache realm/nonce."""
         params = self._extract_auth_params(auth_header)
         realm = params.get("realm", "")
         nonce = params.get("nonce", "")
-        response = self._make_digest_response(method, uri, realm, nonce,
-                                               self._username, self._password)
-        return (f'{header_name}: Digest username="{self._username}", '
-                f'realm="{realm}", nonce="{nonce}", uri="{uri}", '
-                f'response="{response}", algorithm=MD5')
+        qop = params.get("qop", "")
+        # Cache for reuse on subsequent requests (INVITE, unregister, etc)
+        self._auth_realm = realm
+        self._auth_nonce = nonce
+        self._auth_qop = qop
+        self._auth_nc = 1
+        self._auth_cached = True
+
+        if qop == "auth":
+            cnonce = f"{random.randint(10000000, 99999999):08x}"
+            nc = f"{self._auth_nc:08d}"
+            self._auth_nc += 1
+            response = self._make_digest_response(method, uri, realm, nonce,
+                                                   self._username, self._password,
+                                                   qop, cnonce, nc)
+            return (f'{header_name}: Digest username="{self._username}", '
+                    f'realm="{realm}", nonce="{nonce}", uri="{uri}", '
+                    f'response="{response}", algorithm=MD5, '
+                    f'cnonce="{cnonce}", qop={qop}, nc={nc}')
+        else:
+            response = self._make_digest_response(method, uri, realm, nonce,
+                                                   self._username, self._password)
+            return (f'{header_name}: Digest username="{self._username}", '
+                    f'realm="{realm}", nonce="{nonce}", uri="{uri}", '
+                    f'response="{response}", algorithm=MD5')
+
+    def _build_cached_auth_header(self, method, uri, header_name="Authorization"):
+        """Build auth header using cached realm/nonce from prior 401."""
+        if not self._auth_cached:
+            return None
+        qop = getattr(self, '_auth_qop', '')
+        if qop == "auth":
+            cnonce = f"{random.randint(10000000, 99999999):08x}"
+            nc = f"{getattr(self, '_auth_nc', 1):08d}"
+            self._auth_nc = getattr(self, '_auth_nc', 1) + 1
+            response = self._make_digest_response(method, uri, self._auth_realm,
+                                                   self._auth_nonce,
+                                                   self._username, self._password,
+                                                   qop, cnonce, nc)
+            return (f'{header_name}: Digest username="{self._username}", '
+                    f'realm="{self._auth_realm}", nonce="{self._auth_nonce}", uri="{uri}", '
+                    f'response="{response}", algorithm=MD5, '
+                    f'cnonce="{cnonce}", qop={qop}, nc={nc}')
+        else:
+            response = self._make_digest_response(method, uri, self._auth_realm,
+                                                   self._auth_nonce,
+                                                   self._username, self._password)
+            return (f'{header_name}: Digest username="{self._username}", '
+                    f'realm="{self._auth_realm}", nonce="{self._auth_nonce}", uri="{uri}", '
+                    f'response="{response}", algorithm=MD5')
 
     def _parse_sdp(self, body):
         """Extract RTP IP and port from SDP body."""
@@ -386,14 +541,36 @@ class SipHandler(ProtocolHandler):
         return ip, port
 
     def _build_sdp(self):
-        """Build SDP offer with audio on our RTP port."""
-        # Allocate RTP port
+        """Build SDP offer with audio on our RTP port.
+
+        Uses the public (NAT-discovered) IP so the remote end can send
+        RTP back to us through the firewall.
+        """
         rtp_port = self._rtp_port or (self._local_port + 2)
+        # Discover public RTP port via STUN if behind NAT
+        sdp_ip = self._public_ip or self._local_ip
+        if self._nat_detected and not self._rtp_port:
+            # Use STUN to find public mapping for our RTP port
+            try:
+                rtp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                rtp_sock.bind(("", rtp_port))
+                actual_rtp_port = rtp_sock.getsockname()[1]
+                stun_result = stun_discover(rtp_sock)
+                rtp_sock.close()
+                if stun_result:
+                    sdp_ip = stun_result[0]
+                    rtp_port = stun_result[1]
+                    logger.info("STUN discovered RTP: %s:%d", sdp_ip, rtp_port)
+                else:
+                    rtp_port = actual_rtp_port
+            except Exception as e:
+                logger.warning("STUN for RTP failed: %s — using local", e)
+
         sdp = (
             "v=0\r\n"
-            f"o=pysoftphone 0 0 IN IP4 {self._local_ip}\r\n"
+            f"o=pysoftphone 0 0 IN IP4 {sdp_ip}\r\n"
             "s=PySoftphone\r\n"
-            f"c=IN IP4 {self._local_ip}\r\n"
+            f"c=IN IP4 {sdp_ip}\r\n"
             "t=0 0\r\n"
             f"m=audio {rtp_port} RTP/AVP 0 101\r\n"
             "a=rtpmap:0 PCMU/8000\r\n"
@@ -412,10 +589,24 @@ class SipHandler(ProtocolHandler):
         self._local_port = int(config.get("local_port", 5060)) or 5060
         try:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self._sock.settimeout(1.0)
             self._sock.bind(("", self._local_port))
             actual = self._sock.getsockname()[1]
             self._local_port = actual
+
+            # Discover public IP/port via STUN before starting
+            logger.info("Running STUN discovery for NAT traversal...")
+            stun_result = stun_discover(self._sock)
+            if stun_result:
+                self._public_ip, self._public_port = stun_result
+                self._nat_detected = (self._public_ip != self._local_ip)
+                logger.info("STUN: public address %s:%d (NAT %s)",
+                            self._public_ip, self._public_port,
+                            "detected" if self._nat_detected else "not detected")
+            else:
+                logger.warning("STUN discovery failed — NAT traversal may not work")
+
             self._running = True
             self._recv_thread = threading.Thread(target=self._recv_loop,
                                                  daemon=True, name="sip-recv")
@@ -428,11 +619,26 @@ class SipHandler(ProtocolHandler):
             return False
 
     def register(self, server: str, username: str, password: str, port: int = 5060) -> bool:
+        if not self._sock or not self._running:
+            logger.error("SIP not initialized — cannot register")
+            return False
         self._server_addr = (server, port)
         self._username = username
         self._password = password
         self._display_name = self._config.get("display_name", username)
         self._local_ip = self._get_local_ip(server)
+
+        # Run STUN now that we know our local IP (if not already discovered)
+        if not self._public_ip and self._sock:
+            logger.info("Running STUN discovery...")
+            stun_result = stun_discover(self._sock)
+            if stun_result:
+                self._public_ip, self._public_port = stun_result
+                self._nat_detected = (self._public_ip != self._local_ip)
+                logger.info("STUN: public %s:%d (NAT %s)",
+                            self._public_ip, self._public_port,
+                            "detected" if self._nat_detected else "not detected")
+
         self._reg_call_id = _generate_call_id()
         self._reg_from_tag = _generate_tag()
         self._reg_cseq += 1
@@ -487,14 +693,15 @@ class SipHandler(ProtocolHandler):
         self._send_sip(msg)
         logger.info("SIP REGISTER with auth sent")
 
-    def unregister(self):
-        if not self._server_addr:
-            return
+    def _send_unregister_with_auth(self, auth_header):
+        """Re-send REGISTER Expires=0 with digest authentication."""
         server, port = self._server_addr
         self._reg_cseq += 1
         request_uri = f"sip:{server}:{port}"
         from_uri = f'"{self._display_name}" <sip:{self._username}@{server}>'
         to_uri = f"<sip:{self._username}@{server}>"
+
+        auth_line = self._build_auth_header("REGISTER", request_uri, auth_header)
 
         msg = (
             f"REGISTER {request_uri} SIP/2.0\r\n"
@@ -507,15 +714,49 @@ class SipHandler(ProtocolHandler):
             f"Max-Forwards: 70\r\n"
             f"User-Agent: PySoftphone/1.0\r\n"
             f"Expires: 0\r\n"
+            f"{auth_line}\r\n"
             f"Content-Length: 0\r\n"
             f"\r\n"
         )
         self._send_sip(msg)
-        self.registered = False
+        logger.info("SIP REGISTER Expires=0 with auth sent")
+
+    def unregister(self):
+        if not self._server_addr:
+            return
+        self._unregistering = True
+        server, port = self._server_addr
+        self._reg_cseq += 1
+        request_uri = f"sip:{server}:{port}"
+        from_uri = f'"{self._display_name}" <sip:{self._username}@{server}>'
+        to_uri = f"<sip:{self._username}@{server}>"
+
+        # Include cached auth if available (server will 401 otherwise)
+        auth_line = ""
+        if self._auth_cached:
+            auth_hdr = self._build_cached_auth_header("REGISTER", request_uri)
+            if auth_hdr:
+                auth_line = f"{auth_hdr}\r\n"
+
+        msg = (
+            f"REGISTER {request_uri} SIP/2.0\r\n"
+            f"Via: {self._via_header()}\r\n"
+            f"From: {from_uri};tag={self._reg_from_tag}\r\n"
+            f"To: {to_uri}\r\n"
+            f"Call-ID: {self._reg_call_id}\r\n"
+            f"CSeq: {self._reg_cseq} REGISTER\r\n"
+            f"Contact: {self._contact_header()}\r\n"
+            f"Max-Forwards: 70\r\n"
+            f"User-Agent: PySoftphone/1.0\r\n"
+            f"Expires: 0\r\n"
+            f"{auth_line}"
+            f"Content-Length: 0\r\n"
+            f"\r\n"
+        )
+        self._send_sip(msg)
+        logger.info("SIP REGISTER Expires=0 (unregister) sent")
         if self._reg_timer:
             self._reg_timer.cancel()
-        if self._on_registration_state:
-            self._on_registration_state("SIP", False, 0)
 
     def make_call(self, uri: str) -> bool:
         if self.in_call:
@@ -526,7 +767,7 @@ class SipHandler(ProtocolHandler):
             return False
 
         server, port = self._server_addr
-        # Normalize URI
+        # Normalize URI — always route through server as proxy
         if not uri.startswith("sip:"):
             uri = f"sip:{uri}@{server}"
         self._call_remote_uri = uri
@@ -535,9 +776,11 @@ class SipHandler(ProtocolHandler):
         self._call_from_tag = _generate_tag()
         self._call_to_tag = ""
         self._call_cseq = 1
+        self._invite_auth_attempted = False
 
         sdp_body, rtp_port = self._build_sdp()
         self._rtp_port = rtp_port
+        self._cached_sdp = sdp_body  # Cache for auth retry
         from_uri = f'"{self._display_name}" <sip:{self._username}@{server}>'
 
         msg = (
@@ -550,6 +793,7 @@ class SipHandler(ProtocolHandler):
             f"Contact: {self._contact_header()}\r\n"
             f"Max-Forwards: 70\r\n"
             f"User-Agent: PySoftphone/1.0\r\n"
+            f"Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, NOTIFY, REFER\r\n"
             f"Content-Type: application/sdp\r\n"
             f"Content-Length: {len(sdp_body)}\r\n"
             f"\r\n"
@@ -562,16 +806,17 @@ class SipHandler(ProtocolHandler):
             self._on_call_state_change("SIP", "CALLING", "")
         return True
 
-    def _send_invite_with_auth(self, auth_header):
-        """Re-send INVITE with digest auth."""
+    def _send_invite_with_auth(self, auth_header, is_proxy=False):
+        """Re-send INVITE with digest auth (new CSeq, new Via branch)."""
         server, port = self._server_addr
         self._call_cseq += 1
-        sdp_body, rtp_port = self._build_sdp()
-        self._rtp_port = rtp_port
+        # Reuse the same SDP from the original INVITE to keep ports consistent
+        sdp_body = self._cached_sdp
         from_uri = f'"{self._display_name}" <sip:{self._username}@{server}>'
         uri = self._call_remote_uri
 
-        auth_line = self._build_auth_header("INVITE", uri, auth_header)
+        header_name = "Proxy-Authorization" if is_proxy else "Authorization"
+        auth_line = self._build_auth_header("INVITE", uri, auth_header, header_name)
 
         msg = (
             f"INVITE {uri} SIP/2.0\r\n"
@@ -583,6 +828,7 @@ class SipHandler(ProtocolHandler):
             f"Contact: {self._contact_header()}\r\n"
             f"Max-Forwards: 70\r\n"
             f"User-Agent: PySoftphone/1.0\r\n"
+            f"Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, NOTIFY, REFER\r\n"
             f"{auth_line}\r\n"
             f"Content-Type: application/sdp\r\n"
             f"Content-Length: {len(sdp_body)}\r\n"
@@ -590,7 +836,7 @@ class SipHandler(ProtocolHandler):
             f"{sdp_body}"
         )
         self._send_sip(msg)
-        logger.info("SIP INVITE with auth sent")
+        logger.info("SIP INVITE with auth sent (CSeq %d)", self._call_cseq)
 
     def _send_ack(self, to_tag=""):
         """Send ACK for an INVITE transaction."""
@@ -730,7 +976,8 @@ class SipHandler(ProtocolHandler):
         sub_call_id = _generate_call_id()
         sub_tag = _generate_tag()
         self._blf_subscriptions[extension] = {
-            "call_id": sub_call_id, "tag": sub_tag, "cseq": 1
+            "call_id": sub_call_id, "tag": sub_tag, "cseq": 1,
+            "auth_attempted": False,
         }
 
         uri = f"sip:{extension}@{server}"
@@ -755,8 +1002,43 @@ class SipHandler(ProtocolHandler):
         self._send_sip(msg)
         logger.info("SIP SUBSCRIBE (BLF) sent for %s", extension)
 
+    def _send_subscribe_with_auth(self, extension, auth_header):
+        """Re-send SUBSCRIBE with digest authentication."""
+        if extension not in self._blf_subscriptions:
+            return
+        sub = self._blf_subscriptions[extension]
+        sub["cseq"] += 1
+        server, port = self._server_addr
+        uri = f"sip:{extension}@{server}"
+        from_uri = f'"{self._display_name}" <sip:{self._username}@{server}>'
+
+        is_proxy = "proxy" not in auth_header.lower()  # detect from response handler
+        header_name = "Proxy-Authorization" if sub.get("is_proxy") else "Authorization"
+        auth_line = self._build_auth_header("SUBSCRIBE", uri, auth_header, header_name)
+
+        msg = (
+            f"SUBSCRIBE {uri} SIP/2.0\r\n"
+            f"Via: {self._via_header()}\r\n"
+            f"From: {from_uri};tag={sub['tag']}\r\n"
+            f"To: <{uri}>\r\n"
+            f"Call-ID: {sub['call_id']}\r\n"
+            f"CSeq: {sub['cseq']} SUBSCRIBE\r\n"
+            f"Contact: {self._contact_header()}\r\n"
+            f"Max-Forwards: 70\r\n"
+            f"User-Agent: PySoftphone/1.0\r\n"
+            f"Event: dialog\r\n"
+            f"Accept: application/dialog-info+xml\r\n"
+            f"Expires: 3600\r\n"
+            f"{auth_line}\r\n"
+            f"Content-Length: 0\r\n"
+            f"\r\n"
+        )
+        self._send_sip(msg)
+        logger.info("SIP SUBSCRIBE (BLF) with auth sent for %s", extension)
+
     def shutdown(self):
         self._running = False
+        self._stop_keepalive()
         if self._reg_timer:
             self._reg_timer.cancel()
         if self.in_call:
@@ -806,6 +1088,9 @@ class SipHandler(ProtocolHandler):
                 logger.error("Error handling SIP message: %s", e, exc_info=True)
 
     def _handle_message(self, data, addr):
+        text = data.decode("utf-8", errors="replace")
+        logger.debug("SIP RX <<< %s:%d (%d bytes)\n%s",
+                      addr[0], addr[1], len(data), text.rstrip())
         status_code, method, headers, body = self._parse_response(data)
         call_id = headers.get("call-id", "")
 
@@ -821,25 +1106,70 @@ class SipHandler(ProtocolHandler):
         if "REGISTER" in cseq:
             self._handle_register_response(status_code, headers, body)
         elif "INVITE" in cseq:
+            # Only process INVITE responses for the current call
+            if call_id and self._call_id and call_id != self._call_id:
+                logger.debug("Ignoring INVITE response for old Call-ID %s", call_id)
+                return
             self._handle_invite_response(status_code, headers, body)
         elif "BYE" in cseq:
             logger.info("BYE response: %d", status_code)
         elif "SUBSCRIBE" in cseq:
-            logger.info("SUBSCRIBE response: %d", status_code)
+            self._handle_subscribe_response(status_code, headers, body, call_id)
+        elif "OPTIONS" in cseq:
+            pass  # keepalive response — no action needed
+
+    def _extract_to_tag(self, headers):
+        """Extract tag from To header."""
+        to_header = headers.get("to", "")
+        tag_match = re.search(r'tag=([^;>\s]+)', to_header)
+        return tag_match.group(1) if tag_match else ""
+
+    def _parse_via_nat(self, headers):
+        """Extract received= and rport= from Via header for NAT discovery."""
+        via = headers.get("via", "")
+        if isinstance(via, list):
+            via = via[0]
+        received_match = re.search(r'received=([^;,\s]+)', via)
+        rport_match = re.search(r'rport=(\d+)', via)
+        if received_match:
+            public_ip = received_match.group(1)
+            public_port = int(rport_match.group(1)) if rport_match else self._local_port
+            if public_ip != self._local_ip or public_port != self._local_port:
+                self._public_ip = public_ip
+                self._public_port = public_port
+                self._nat_detected = True
+                logger.info("NAT detected via rport: public %s:%d (local %s:%d)",
+                            public_ip, public_port, self._local_ip, self._local_port)
+            return public_ip, public_port
+        return None, None
 
     def _handle_register_response(self, status_code, headers, body):
         if status_code == 200:
-            self.registered = True
-            logger.info("SIP registered successfully")
-            if self._on_registration_state:
-                self._on_registration_state("SIP", True, 200)
-            # Schedule re-registration
-            if self._reg_timer:
-                self._reg_timer.cancel()
-            self._reg_timer = threading.Timer(
-                self._reg_expires - 30, self._re_register)
-            self._reg_timer.daemon = True
-            self._reg_timer.start()
+            # Parse Via for NAT-discovered public address
+            self._parse_via_nat(headers)
+
+            if self._unregistering:
+                # Successful unregister
+                self._unregistering = False
+                self.registered = False
+                self._stop_keepalive()
+                logger.info("SIP unregistered successfully")
+                if self._on_registration_state:
+                    self._on_registration_state("SIP", False, 0)
+            else:
+                self.registered = True
+                logger.info("SIP registered successfully")
+                if self._on_registration_state:
+                    self._on_registration_state("SIP", True, 200)
+                # Schedule re-registration
+                if self._reg_timer:
+                    self._reg_timer.cancel()
+                self._reg_timer = threading.Timer(
+                    self._reg_expires - 30, self._re_register)
+                self._reg_timer.daemon = True
+                self._reg_timer.start()
+                # Start keepalive pings
+                self._start_keepalive()
 
         elif status_code == 401 or status_code == 407:
             # Authentication required
@@ -849,19 +1179,26 @@ class SipHandler(ProtocolHandler):
             if auth_header:
                 if isinstance(auth_header, list):
                     auth_header = auth_header[0]
-                self._send_register_with_auth(auth_header)
+                if self._unregistering:
+                    # Re-send unregister with fresh auth
+                    self._send_unregister_with_auth(auth_header)
+                else:
+                    self._send_register_with_auth(auth_header)
             else:
                 logger.error("SIP 401 but no auth header")
+                self._unregistering = False
                 if self._on_registration_state:
                     self._on_registration_state("SIP", False, status_code)
 
         elif status_code == 403:
             logger.error("SIP registration forbidden (403)")
+            self._unregistering = False
             if self._on_registration_state:
                 self._on_registration_state("SIP", False, 403)
 
         else:
             logger.warning("SIP REGISTER response: %d", status_code)
+            self._unregistering = False
             if status_code >= 400:
                 if self._on_registration_state:
                     self._on_registration_state("SIP", False, status_code)
@@ -880,44 +1217,115 @@ class SipHandler(ProtocolHandler):
             if tag_match:
                 self._call_to_tag = tag_match.group(1)
 
+            # Send ACK (always, even for retransmitted 200s)
+            self._send_ack(self._call_to_tag)
+
+            # Only start RTP on first 200 OK (ignore retransmissions or late 200s after BYE)
+            if self._rtp_session or not self.in_call:
+                logger.debug("Ignoring retransmitted 200 OK (RTP already active or call ended)")
+                return
+
             # Parse SDP for remote RTP address
             if body:
                 rtp_ip, rtp_port = self._parse_sdp(body)
                 if rtp_ip and rtp_port:
                     self._start_rtp(rtp_ip, rtp_port)
 
-            # Send ACK
-            self._send_ack(self._call_to_tag)
             logger.info("SIP call connected")
             if self._on_call_state_change:
                 self._on_call_state_change("SIP", "CONFIRMED", "")
 
         elif status_code == 401 or status_code == 407:
-            # Need auth for INVITE
-            auth_header = headers.get("www-authenticate", "")
-            if not auth_header:
-                auth_header = headers.get("proxy-authenticate", "")
+            # Need auth for INVITE — only retry ONCE then give up
+            if self._invite_auth_attempted:
+                # Already sent an auth'd INVITE — ignore retransmissions
+                logger.debug("Ignoring retransmitted %d (auth already sent)", status_code)
+                return
+
+            self._invite_auth_attempted = True
+            # Determine which auth header type was sent by the server
+            is_proxy = False
+            auth_header = headers.get("proxy-authenticate", "")
+            if auth_header:
+                is_proxy = True
+            else:
+                auth_header = headers.get("www-authenticate", "")
             if auth_header:
                 if isinstance(auth_header, list):
                     auth_header = auth_header[0]
-                # ACK the 401
-                self._send_ack()
-                self._send_invite_with_auth(auth_header)
+                # ACK the 407 first (required by RFC 3261)
+                to_tag = self._extract_to_tag(headers)
+                self._send_ack(to_tag)
+                self._send_invite_with_auth(auth_header, is_proxy)
+            else:
+                logger.error("SIP %d but no auth header found", status_code)
+                self._send_ack(self._extract_to_tag(headers))
+                self.in_call = False
+                self._call_id = ""
+                if self._on_call_state_change:
+                    self._on_call_state_change("SIP", "REJECTED", "No auth challenge")
 
         elif status_code == 486 or status_code == 600:
-            self._send_ack()
+            to_tag = self._extract_to_tag(headers)
+            self._send_ack(to_tag)
             self.in_call = False
             self._call_id = ""
             if self._on_call_state_change:
                 self._on_call_state_change("SIP", "BUSY", "Busy")
 
+        elif status_code == 503:
+            to_tag = self._extract_to_tag(headers)
+            self._send_ack(to_tag)
+            self.in_call = False
+            self._call_id = ""
+            logger.warning("SIP 503 Service Unavailable — destination unreachable")
+            if self._on_call_state_change:
+                self._on_call_state_change("SIP", "REJECTED", "503 Service Unavailable")
+
         elif status_code >= 400:
-            self._send_ack()
+            to_tag = self._extract_to_tag(headers)
+            self._send_ack(to_tag)
             self.in_call = False
             self._call_id = ""
             logger.warning("SIP INVITE rejected: %d", status_code)
             if self._on_call_state_change:
                 self._on_call_state_change("SIP", "REJECTED", str(status_code))
+
+    def _handle_subscribe_response(self, status_code, headers, body, call_id):
+        """Handle responses to SUBSCRIBE requests (BLF)."""
+        if status_code == 200:
+            logger.info("SUBSCRIBE accepted")
+        elif status_code == 401 or status_code == 407:
+            # Find which subscription this belongs to by Call-ID
+            extension = None
+            for ext, sub in self._blf_subscriptions.items():
+                if sub["call_id"] == call_id:
+                    extension = ext
+                    break
+            if not extension:
+                logger.warning("SUBSCRIBE %d for unknown Call-ID %s", status_code, call_id)
+                return
+            sub = self._blf_subscriptions[extension]
+            if sub.get("auth_attempted"):
+                logger.warning("SUBSCRIBE auth failed for %s", extension)
+                return
+            sub["auth_attempted"] = True
+            # Get auth header
+            is_proxy = False
+            auth_header = headers.get("proxy-authenticate", "")
+            if auth_header:
+                is_proxy = True
+            else:
+                auth_header = headers.get("www-authenticate", "")
+            if auth_header:
+                if isinstance(auth_header, list):
+                    auth_header = auth_header[0]
+                sub["is_proxy"] = is_proxy
+                self._send_subscribe_with_auth(extension, auth_header)
+            else:
+                logger.error("SUBSCRIBE %d but no auth header", status_code)
+        else:
+            logger.info("SUBSCRIBE response: %d", status_code)
 
     def _handle_request(self, method, headers, body, addr):
         """Handle incoming SIP requests."""
@@ -1096,3 +1504,47 @@ class SipHandler(ProtocolHandler):
             logger.info("SIP re-registration")
             self.register(self._server_addr[0], self._username,
                           self._password, self._server_addr[1])
+
+    # -- Keepalive ---------------------------------------------------------------
+
+    def _start_keepalive(self):
+        """Start periodic OPTIONS keepalive pings."""
+        self._stop_keepalive()
+        self._send_keepalive()
+
+    def _stop_keepalive(self):
+        if self._keepalive_timer:
+            self._keepalive_timer.cancel()
+            self._keepalive_timer = None
+
+    def _send_keepalive(self):
+        """Send OPTIONS keepalive and schedule next."""
+        if not self._running or not self._server_addr or not self.registered:
+            return
+        server, port = self._server_addr
+        uri = f"sip:{server}:{port}"
+        from_uri = f'"{self._display_name}" <sip:{self._username}@{server}>'
+        to_uri = f"<sip:{server}>"
+        call_id = _generate_call_id()
+
+        msg = (
+            f"OPTIONS {uri} SIP/2.0\r\n"
+            f"Via: {self._via_header()}\r\n"
+            f"From: {from_uri};tag={_generate_tag()}\r\n"
+            f"To: {to_uri}\r\n"
+            f"Call-ID: {call_id}\r\n"
+            f"CSeq: 1 OPTIONS\r\n"
+            f"Contact: {self._contact_header()}\r\n"
+            f"Max-Forwards: 70\r\n"
+            f"User-Agent: PySoftphone/1.0\r\n"
+            f"Content-Length: 0\r\n"
+            f"\r\n"
+        )
+        self._send_sip(msg)
+        logger.debug("SIP keepalive OPTIONS sent")
+
+        # Schedule next keepalive
+        self._keepalive_timer = threading.Timer(
+            self._keepalive_interval, self._send_keepalive)
+        self._keepalive_timer.daemon = True
+        self._keepalive_timer.start()

@@ -4,11 +4,13 @@ import tkinter as tk
 import threading
 import time
 import logging
+import winsound
 from datetime import datetime
 
 from gui.theme import get_theme
 from gui.dialpad import Dialpad
 from gui.blf_panel import BlfPanel
+from gui.contacts_panel import ContactsPanel
 from gui.call_history import CallHistoryPanel
 from gui.settings_dialog import SettingsDialog
 from protocols.sip_handler import SipHandler
@@ -37,6 +39,8 @@ class MainWindow:
         self._current_call = None
         self._call_timer_running = False
         self._call_start_time = None
+        self._ringing = False
+        self._ring_type = "ringback"  # "ringback" for outbound, "incoming" for inbound
 
         self._build_window()
         self._setup_protocols()
@@ -102,12 +106,46 @@ class MainWindow:
         content = tk.Frame(self.root, bg=c["bg"])
         content.pack(fill=tk.BOTH, expand=True)
 
-        # Left: BLF panel
-        blf_container = tk.Frame(content, bg=c["bg_secondary"], width=200)
-        blf_container.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 0), pady=4)
-        blf_container.pack_propagate(False)
+        # Left: Tabbed panel (Contacts / Favorites / BLF)
+        left_container = tk.Frame(content, bg=c["bg_secondary"], width=220)
+        left_container.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 0), pady=4)
+        left_container.pack_propagate(False)
 
-        self.blf_panel = BlfPanel(blf_container, theme_name=self.theme_name,
+        # Tab bar
+        left_tab_bar = tk.Frame(left_container, bg=c["bg_secondary"])
+        left_tab_bar.pack(fill=tk.X)
+
+        self._left_tabs = {}
+        self._left_tab_frames = {}
+        self._left_active_tab = None
+
+        left_content = tk.Frame(left_container, bg=c["bg_secondary"])
+        left_content.pack(fill=tk.BOTH, expand=True)
+
+        for tab_name in ["Contacts", "BLF"]:
+            btn = tk.Label(left_tab_bar, text=tab_name, font=("Segoe UI", 9),
+                           bg=c["bg_secondary"], fg=c["fg"], cursor="hand2",
+                           padx=12, pady=4)
+            btn.pack(side=tk.LEFT)
+            btn.bind("<Button-1>", lambda e, n=tab_name: self._switch_left_tab(n))
+            self._left_tabs[tab_name] = btn
+
+            frame = tk.Frame(left_content, bg=c["bg_secondary"])
+            self._left_tab_frames[tab_name] = frame
+
+        # Contacts panel
+        self.contacts_panel = ContactsPanel(
+            self._left_tab_frames["Contacts"], theme_name=self.theme_name,
+            on_dial=self._redial, on_change=self._save_contacts)
+        self.contacts_panel.pack(fill=tk.BOTH, expand=True)
+
+        # Load saved contacts
+        contacts_list = self.config.get("contacts", {}).get("entries", [])
+        self.contacts_panel.load_contacts(contacts_list)
+
+        # BLF panel
+        self.blf_panel = BlfPanel(self._left_tab_frames["BLF"],
+                                  theme_name=self.theme_name,
                                   on_click=self._blf_clicked)
         self.blf_panel.pack(fill=tk.BOTH, expand=True)
 
@@ -115,6 +153,8 @@ class MainWindow:
         blf_entries = self.config.get("blf", {}).get("entries", [])
         self.blf_panel.load_entries(blf_entries)
         self.blf_panel.bind("<<BlfAdded>>", lambda e: self._save_blf())
+
+        self._switch_left_tab("Contacts")
 
         # Center: Dialpad
         center = tk.Frame(content, bg=c["bg"])
@@ -257,6 +297,7 @@ class MainWindow:
             self.status_var.set("Call failed")
 
     def _answer_call(self):
+        self._stop_ringtone()
         handler = self._active_handler()
         handler.answer_call()
         if self._current_call:
@@ -287,11 +328,49 @@ class MainWindow:
         self.status_var.set("Call on hold")
 
     def _transfer(self):
-        number = self.dialpad.number_var.get().strip()
-        if number:
-            handler = self._active_handler()
-            handler.transfer_call(number)
-            self.status_var.set(f"Transferring to {number}")
+        """Show transfer dialog and execute blind transfer."""
+        handler = self._active_handler()
+        if not handler.in_call:
+            self.status_var.set("Not in a call")
+            return
+
+        c = self.colors
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Transfer Call")
+        dialog.geometry("300x140")
+        dialog.configure(bg=c["bg"])
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        tk.Label(dialog, text="Transfer to:", bg=c["bg"], fg=c["fg"],
+                 font=("Segoe UI", 11)).pack(anchor=tk.W, padx=15, pady=(15, 2))
+
+        target_var = tk.StringVar(value=self.dialpad.number_var.get().strip())
+        entry = tk.Entry(dialog, textvariable=target_var, bg=c["bg_input"],
+                         fg=c["fg"], font=("Segoe UI", 14), relief=tk.FLAT, bd=4,
+                         insertbackground=c["fg"])
+        entry.pack(fill=tk.X, padx=15)
+        entry.focus_set()
+        entry.select_range(0, tk.END)
+
+        def _do_transfer():
+            number = target_var.get().strip()
+            if number:
+                handler.transfer_call(number)
+                self.status_var.set(f"Transferring to {number}...")
+                dialog.destroy()
+
+        entry.bind("<Return>", lambda e: _do_transfer())
+
+        btn_frame = tk.Frame(dialog, bg=c["bg"])
+        btn_frame.pack(fill=tk.X, padx=15, pady=10)
+
+        tk.Button(btn_frame, text="Transfer", command=_do_transfer,
+                  bg=c["accent"], fg="#ffffff", font=("Segoe UI", 10, "bold"),
+                  relief=tk.FLAT, padx=20, pady=4).pack(side=tk.LEFT)
+        tk.Button(btn_frame, text="Cancel", command=dialog.destroy,
+                  bg=c["button_bg"], fg=c["button_fg"], font=("Segoe UI", 10),
+                  relief=tk.FLAT, padx=20, pady=4).pack(side=tk.LEFT, padx=(8, 0))
 
     def _mute(self):
         self.status_var.set("Mute toggled")
@@ -310,18 +389,21 @@ class MainWindow:
             display = f"{remote_name} <{remote_number}>" if remote_name else remote_number
             self.dialpad.show_incoming(display)
             self.status_var.set(f"Incoming {protocol} call: {display}")
+            self._start_ringtone("incoming")
         self.root.after(0, _update)
 
     def _on_call_state_change(self, protocol, state, reason):
         """Handle call state changes."""
         def _update():
             if state == "CONFIRMED":
+                self._stop_ringtone()
                 if self._current_call:
                     self._current_call.answer()
                 self._start_call_timer()
                 self.status_var.set(f"In call ({protocol})")
                 self.dialpad.caller_info_var.set("Connected")
             elif state == "DISCONNECTED":
+                self._stop_ringtone()
                 self._stop_call_timer()
                 if self._current_call:
                     self._current_call.end()
@@ -332,12 +414,14 @@ class MainWindow:
                 self.dialpad.timer_var.set("")
                 self.status_var.set(f"Call ended: {reason}")
             elif state == "RINGING":
+                self._start_ringtone("ringback")
                 self.status_var.set("Ringing...")
             elif state == "HOLD":
                 self.status_var.set("On hold")
             elif state == "CALLING":
                 self.status_var.set("Calling...")
             elif state in ("REJECTED", "BUSY"):
+                self._stop_ringtone()
                 if self._current_call:
                     self._current_call.status = "rejected"
                     self._current_call.end()
@@ -373,6 +457,59 @@ class MainWindow:
     def _on_blf_state_change(self, extension, state):
         """Handle BLF presence changes."""
         self.root.after(0, lambda: self.blf_panel.update_state(extension, state))
+
+    # ---- Ringtone ----
+
+    def _start_ringtone(self, ring_type="ringback"):
+        """Play a ringtone loop in a background thread."""
+        if self._ringing:
+            return
+        self._ringing = True
+        self._ring_type = ring_type
+        threading.Thread(target=self._ringtone_loop, daemon=True).start()
+
+    def _stop_ringtone(self):
+        self._ringing = False
+
+    def _check_ringing(self, chunks=1):
+        """Sleep in small chunks, return False if ringing stopped."""
+        for _ in range(chunks):
+            if not self._ringing:
+                return False
+            time.sleep(0.1)
+        return True
+
+    def _ringtone_loop(self):
+        """Play US standard ring cadence."""
+        while self._ringing:
+            try:
+                if self._ring_type == "ringback":
+                    # US ringback tone: 440Hz for 1s, 480Hz for 1s, 4s silence
+                    winsound.Beep(440, 1000)
+                    if not self._ringing:
+                        return
+                    winsound.Beep(480, 1000)
+                    if not self._ringing:
+                        return
+                    # 4 second silence
+                    if not self._check_ringing(40):
+                        return
+                else:
+                    # US incoming ring: two bursts of 1s, 4s silence
+                    winsound.Beep(1200, 1000)
+                    if not self._ringing:
+                        return
+                    # Short gap
+                    if not self._check_ringing(3):
+                        return
+                    winsound.Beep(1200, 1000)
+                    if not self._ringing:
+                        return
+                    # 4 second silence
+                    if not self._check_ringing(40):
+                        return
+            except Exception:
+                break
 
     # ---- Call timer ----
 
@@ -415,6 +552,25 @@ class MainWindow:
         )
         self.history_panel.refresh()
 
+    # ---- Left panel tabs ----
+
+    def _switch_left_tab(self, name):
+        c = self.colors
+        if self._left_active_tab:
+            self._left_tab_frames[self._left_active_tab].pack_forget()
+            self._left_tabs[self._left_active_tab].configure(
+                bg=c["bg_secondary"], fg=c["fg"])
+        self._left_tab_frames[name].pack(fill=tk.BOTH, expand=True)
+        self._left_tabs[name].configure(bg=c["accent"], fg="#ffffff")
+        self._left_active_tab = name
+
+    # ---- Contacts ----
+
+    def _save_contacts(self):
+        self.config.setdefault("contacts", {})["entries"] = \
+            self.contacts_panel.get_contacts()
+        save_config(self.config)
+
     # ---- BLF ----
 
     def _blf_clicked(self, extension):
@@ -448,6 +604,7 @@ class MainWindow:
 
     def _on_close(self):
         """Clean shutdown."""
+        self._save_contacts()
         self._save_blf()
         self.sip.shutdown()
         self.iax.shutdown()
