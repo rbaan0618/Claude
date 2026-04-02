@@ -816,6 +816,7 @@ class SipHandler(ProtocolHandler):
         self._call_cseq = 1
         self._invite_auth_attempted = False
 
+        self._close_stun_sock()  # Clean up any leftover STUN socket
         sdp_body, bind_port, sdp_port, rtp_sock = self._build_sdp()
         self._rtp_port = bind_port
         self._rtp_sdp_port = sdp_port
@@ -910,6 +911,7 @@ class SipHandler(ProtocolHandler):
         if not self._call_id:
             return
         server, port = self._server_addr
+        self._close_stun_sock()  # Clean up any leftover STUN socket
         sdp_body, bind_port, sdp_port, rtp_sock = self._build_sdp()
         self._rtp_port = bind_port
         self._rtp_sdp_port = sdp_port
@@ -1369,6 +1371,16 @@ class SipHandler(ProtocolHandler):
 
     # -- RTP management ------------------------------------------------------
 
+    def _close_stun_sock(self):
+        """Close any leftover STUN socket to free the port."""
+        sock = getattr(self, '_rtp_stun_sock', None)
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            self._rtp_stun_sock = None
+
     def _start_rtp(self, remote_ip, remote_port):
         """Start RTP audio session."""
         self._stop_rtp()
@@ -1376,19 +1388,30 @@ class SipHandler(ProtocolHandler):
         output_dev = self._audio_config.get("output_device", "")
         in_idx = int(input_dev) if input_dev not in ("", None) else None
         out_idx = int(output_dev) if output_dev not in ("", None) else None
-        stun_sock = getattr(self, '_rtp_stun_sock', None)
+        stun_sock = self._rtp_stun_sock
         self._rtp_stun_sock = None  # Consume the socket
-        self._rtp_session = RtpSession(self._rtp_port, input_device=in_idx,
-                                        output_device=out_idx, sock=stun_sock)
-        actual_port = self._rtp_session.start(remote_ip, remote_port)
-        self._rtp_port = actual_port
-        logger.info("RTP session started: local=%d remote=%s:%d",
-                     actual_port, remote_ip, remote_port)
+        try:
+            self._rtp_session = RtpSession(self._rtp_port, input_device=in_idx,
+                                            output_device=out_idx, sock=stun_sock)
+            actual_port = self._rtp_session.start(remote_ip, remote_port)
+            self._rtp_port = actual_port
+            logger.info("RTP session started: local=%d remote=%s:%d",
+                         actual_port, remote_ip, remote_port)
+        except Exception as e:
+            logger.error("Failed to start RTP: %s", e)
+            # Close the stun_sock if RtpSession failed to use it
+            if stun_sock:
+                try:
+                    stun_sock.close()
+                except Exception:
+                    pass
+            self._rtp_session = None
 
     def _stop_rtp(self):
         if self._rtp_session:
             self._rtp_session.stop()
             self._rtp_session = None
+        self._close_stun_sock()
 
     # -- Receive loop --------------------------------------------------------
 
@@ -1561,13 +1584,14 @@ class SipHandler(ProtocolHandler):
                 logger.debug("Ignoring late 200 OK (call ended)")
                 return
 
-            # Parse SDP for remote RTP address
+            # Parse SDP for remote RTP address and start audio
             if body:
                 rtp_ip, rtp_port = self._parse_sdp(body)
                 if rtp_ip and rtp_port:
                     self._start_rtp(rtp_ip, rtp_port)
 
-            logger.info("SIP call connected")
+            logger.info("SIP call connected%s",
+                         "" if self._rtp_session else " (no audio)")
             if self._on_call_state_change:
                 self._on_call_state_change("SIP", "CONFIRMED", "")
 
