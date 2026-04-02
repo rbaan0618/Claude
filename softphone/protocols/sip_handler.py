@@ -1383,13 +1383,14 @@ class SipHandler(ProtocolHandler):
 
     def _start_rtp(self, remote_ip, remote_port):
         """Start RTP audio session."""
+        # Save stun_sock BEFORE _stop_rtp (which would close it)
+        stun_sock = self._rtp_stun_sock
+        self._rtp_stun_sock = None  # Consume before _stop_rtp can close it
         self._stop_rtp()
         input_dev = self._audio_config.get("input_device", "")
         output_dev = self._audio_config.get("output_device", "")
         in_idx = int(input_dev) if input_dev not in ("", None) else None
         out_idx = int(output_dev) if output_dev not in ("", None) else None
-        stun_sock = self._rtp_stun_sock
-        self._rtp_stun_sock = None  # Consume the socket
         try:
             self._rtp_session = RtpSession(self._rtp_port, input_device=in_idx,
                                             output_device=out_idx, sock=stun_sock)
