@@ -17,6 +17,7 @@ import random
 import struct
 import logging
 import re
+import urllib.parse
 from typing import Optional
 from protocols.base import ProtocolHandler
 
@@ -135,10 +136,11 @@ class RtpSession:
     FRAME_SIZE = 160  # 20ms at 8000Hz
     PTIME = 20  # ms
 
-    def __init__(self, local_port, input_device=None, output_device=None):
+    def __init__(self, local_port, input_device=None, output_device=None,
+                 sock=None):
         self._local_port = local_port
         self._remote_addr = None
-        self._sock = None
+        self._sock = sock  # Pre-bound socket (from STUN) or None
         self._running = False
         self._seq = random.randint(0, 65535)
         self._timestamp = random.randint(0, 0xFFFFFFFF)
@@ -155,9 +157,10 @@ class RtpSession:
     def start(self, remote_ip, remote_port):
         """Start RTP audio session."""
         self._remote_addr = (remote_ip, remote_port)
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        if self._sock is None:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.bind(("", self._local_port))
         self._sock.settimeout(0.1)
-        self._sock.bind(("", self._local_port))
         actual_port = self._sock.getsockname()[1]
         self._local_port = actual_port
         self._running = True
@@ -379,7 +382,9 @@ class SipHandler(ProtocolHandler):
         self._invite_auth_attempted = False  # True after we've sent one auth'd INVITE
         self._cached_sdp = ""   # Cached SDP body for INVITE re-send with auth
         self._rtp_session: Optional[RtpSession] = None
-        self._rtp_port = 0
+        self._rtp_port = 0         # Local bind port for RTP socket
+        self._rtp_sdp_port = 0     # Public port advertised in SDP (may differ behind NAT)
+        self._rtp_stun_sock = None # Pre-bound STUN socket passed to RtpSession
         self._on_hold = False
         self._hold_pending = False  # True while re-INVITE for hold/unhold is in flight
         # Attended transfer — saved original call state
@@ -560,27 +565,41 @@ class SipHandler(ProtocolHandler):
         """Build SDP offer with audio on our RTP port.
 
         Uses the public (NAT-discovered) IP so the remote end can send
-        RTP back to us through the firewall.
+        RTP back to us through the firewall.  Returns (sdp, bind_port, sdp_port)
+        where bind_port is the local port for socket binding and sdp_port is
+        the public port advertised in SDP (may differ behind NAT).
         """
-        rtp_port = self._rtp_port or (self._local_port + 2)
-        # Discover public RTP port via STUN if behind NAT
+        # Use preferred port, or 0 to let OS pick a free one
+        preferred_port = self._rtp_port if self._rtp_port else (self._local_port + 2)
         sdp_ip = self._public_ip or self._local_ip
-        if self._nat_detected and not self._rtp_port:
-            # Use STUN to find public mapping for our RTP port
+        rtp_sock = None  # Keep socket alive for RtpSession reuse
+        if self._nat_detected:
+            # Use STUN to find public mapping and open NAT pinhole
             try:
                 rtp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                rtp_sock.bind(("", rtp_port))
-                actual_rtp_port = rtp_sock.getsockname()[1]
+                try:
+                    rtp_sock.bind(("", preferred_port))
+                except OSError:
+                    # Preferred port in use (e.g. held call), let OS pick
+                    rtp_sock.bind(("", 0))
+                bind_port = rtp_sock.getsockname()[1]
                 stun_result = stun_discover(rtp_sock)
-                rtp_sock.close()
+                # Keep rtp_sock open — pass to RtpSession to preserve NAT pinhole
                 if stun_result:
                     sdp_ip = stun_result[0]
-                    rtp_port = stun_result[1]
-                    logger.info("STUN discovered RTP: %s:%d", sdp_ip, rtp_port)
+                    sdp_port = stun_result[1]
+                    logger.info("STUN discovered RTP: %s:%d (local %d)",
+                                sdp_ip, sdp_port, bind_port)
                 else:
-                    rtp_port = actual_rtp_port
+                    sdp_port = bind_port
             except Exception as e:
                 logger.warning("STUN for RTP failed: %s — using local", e)
+                bind_port = preferred_port
+                sdp_port = preferred_port
+                rtp_sock = None
+        else:
+            bind_port = preferred_port
+            sdp_port = preferred_port
 
         sdp = (
             "v=0\r\n"
@@ -588,14 +607,14 @@ class SipHandler(ProtocolHandler):
             "s=MyLineTelecom\r\n"
             f"c=IN IP4 {sdp_ip}\r\n"
             "t=0 0\r\n"
-            f"m=audio {rtp_port} RTP/AVP 0 101\r\n"
+            f"m=audio {sdp_port} RTP/AVP 0 101\r\n"
             "a=rtpmap:0 PCMU/8000\r\n"
             "a=rtpmap:101 telephone-event/8000\r\n"
             "a=fmtp:101 0-16\r\n"
             "a=ptime:20\r\n"
             "a=sendrecv\r\n"
         )
-        return sdp, rtp_port
+        return sdp, bind_port, sdp_port, rtp_sock
 
     # -- Protocol interface --------------------------------------------------
 
@@ -797,8 +816,10 @@ class SipHandler(ProtocolHandler):
         self._call_cseq = 1
         self._invite_auth_attempted = False
 
-        sdp_body, rtp_port = self._build_sdp()
-        self._rtp_port = rtp_port
+        sdp_body, bind_port, sdp_port, rtp_sock = self._build_sdp()
+        self._rtp_port = bind_port
+        self._rtp_sdp_port = sdp_port
+        self._rtp_stun_sock = rtp_sock  # Keep STUN socket alive for RTP reuse
         self._cached_sdp = sdp_body  # Cache for auth retry
         from_uri = f'"{self._display_name}" <sip:{self._username}@{server}>'
 
@@ -889,8 +910,10 @@ class SipHandler(ProtocolHandler):
         if not self._call_id:
             return
         server, port = self._server_addr
-        sdp_body, rtp_port = self._build_sdp()
-        self._rtp_port = rtp_port
+        sdp_body, bind_port, sdp_port, rtp_sock = self._build_sdp()
+        self._rtp_port = bind_port
+        self._rtp_sdp_port = sdp_port
+        self._rtp_stun_sock = rtp_sock  # Keep STUN socket alive for RTP reuse
         to_uri = f'"{self._display_name}" <sip:{self._username}@{server}>'
 
         msg = (
@@ -960,7 +983,7 @@ class SipHandler(ProtocolHandler):
     def _build_hold_sdp(self):
         """Build SDP with a=sendonly for hold."""
         sdp_ip = self._public_ip or self._local_ip
-        rtp_port = self._rtp_port or (self._local_port + 2)
+        rtp_port = self._rtp_sdp_port or self._rtp_port or (self._local_port + 2)
         sdp = (
             "v=0\r\n"
             f"o=pysoftphone 0 1 IN IP4 {sdp_ip}\r\n"
@@ -979,7 +1002,7 @@ class SipHandler(ProtocolHandler):
     def _build_unhold_sdp(self):
         """Build SDP with a=sendrecv for unhold."""
         sdp_ip = self._public_ip or self._local_ip
-        rtp_port = self._rtp_port or (self._local_port + 2)
+        rtp_port = self._rtp_sdp_port or self._rtp_port or (self._local_port + 2)
         sdp = (
             "v=0\r\n"
             f"o=pysoftphone 0 2 IN IP4 {sdp_ip}\r\n"
@@ -1122,17 +1145,21 @@ class SipHandler(ProtocolHandler):
             "call_from_tag": self._call_from_tag,
             "call_to_tag": self._call_to_tag,
             "call_remote_uri": self._call_remote_uri,
+            "call_remote_tag": self._call_remote_tag,
+            "call_direction": self._call_direction,
             "rtp_session": self._rtp_session,
             "rtp_port": self._rtp_port,
+            "rtp_sdp_port": self._rtp_sdp_port,
             "invite_auth_attempted": self._invite_auth_attempted,
             "transfer_target": consult_uri,
+            "incoming_from": getattr(self, "_incoming_from", ""),
         }
         # Clear call state for the new consultation call
         self._rtp_session = None
         self._hold_pending = False
-        # Use a different RTP port for the consultation call (offset from held call)
-        held_rtp = self._rtp_port
-        self._rtp_port = held_rtp + 2 if held_rtp else 0
+        # Use port 0 so OS picks a free port (held call still has its port bound)
+        self._rtp_port = 0
+        self._rtp_sdp_port = 0
         self.in_call = False
         self._call_id = ""
         self._invite_auth_attempted = False
@@ -1141,36 +1168,88 @@ class SipHandler(ProtocolHandler):
         logger.info("Consultation call started to %s (original call on hold)", target)
 
     def complete_attended_transfer(self):
-        """Complete attended transfer: REFER held call to consultation target, hang up consultation."""
+        """Complete attended transfer using REFER with Replaces header.
+
+        Sends REFER on call A (held) telling the server to bridge A with B
+        (the consultation call), using Replaces to reference B's dialog.
+        Both our legs (A and B) will be BYE'd by the server after bridging.
+        """
         if not self._held_call:
             logger.warning("No held call to transfer")
             return
-        transfer_target = self._held_call["transfer_target"]
 
-        # Hang up the consultation call
-        self.hangup_call()
-
-        # Restore the held call state
         held = self._held_call
+        server, port = self._server_addr
+
+        # Build the Replaces header value for call B (current consultation call)
+        # Format: Replaces: call-id;to-tag=X;from-tag=Y (URL-encoded in Refer-To)
+        consult_call_id = self._call_id
+        consult_from_tag = self._call_from_tag
+        consult_to_tag = self._call_to_tag
+        transfer_target = held["transfer_target"]
+
+        # URL-encode the Replaces parameter for the Refer-To header
+        replaces_value = f"{consult_call_id};to-tag={consult_to_tag};from-tag={consult_from_tag}"
+        replaces_encoded = urllib.parse.quote(replaces_value, safe="")
+        refer_to = f"<{transfer_target}?Replaces={replaces_encoded}>"
+
+        # Restore call A (held) to send REFER on it
         self._call_id = held["call_id"]
         self._call_cseq = held["call_cseq"]
         self._call_from_tag = held["call_from_tag"]
         self._call_to_tag = held["call_to_tag"]
         self._call_remote_uri = held["call_remote_uri"]
+        self._call_remote_tag = held.get("call_remote_tag", "")
+        self._call_direction = held.get("call_direction", "outbound")
+        self._incoming_from = held.get("incoming_from", "")
         self._rtp_session = held["rtp_session"]
         self._rtp_port = held["rtp_port"]
         self.in_call = True
 
-        # Send REFER on the original call to transfer it to the consultation target
-        self.transfer_call(transfer_target)
-        logger.info("Attended transfer completed — REFER sent to %s", transfer_target)
+        # Send REFER on call A with Replaces pointing to call B
+        self._call_cseq += 1
+        uri = self._call_remote_uri or f"sip:{server}"
 
-        # Clean up — the REFER will cause the server to bridge the calls
+        if self._call_direction == "inbound":
+            from_line = f'"{self._display_name}" <sip:{self._username}@{server}>;tag={self._call_from_tag}'
+            to_line = self._incoming_from
+            if self._call_remote_tag and "tag=" not in to_line:
+                to_line += f";tag={self._call_remote_tag}"
+        else:
+            from_line = f'"{self._display_name}" <sip:{self._username}@{server}>;tag={self._call_from_tag}'
+            to_line = f"<{uri}>"
+            if self._call_to_tag:
+                to_line += f";tag={self._call_to_tag}"
+
+        msg = (
+            f"REFER {uri} SIP/2.0\r\n"
+            f"Via: {self._via_header()}\r\n"
+            f"From: {from_line}\r\n"
+            f"To: {to_line}\r\n"
+            f"Call-ID: {self._call_id}\r\n"
+            f"CSeq: {self._call_cseq} REFER\r\n"
+            f"Contact: {self._contact_header()}\r\n"
+            f"Refer-To: {refer_to}\r\n"
+            f"Referred-By: <sip:{self._username}@{server}>\r\n"
+            f"Max-Forwards: 70\r\n"
+            f"Content-Length: 0\r\n"
+            f"\r\n"
+        )
+        if self._auth_cached:
+            auth_line = self._build_cached_auth_header("REFER", uri)
+            msg = msg.replace("Max-Forwards: 70\r\n",
+                              f"Max-Forwards: 70\r\n{auth_line}\r\n")
+        self._send_sip(msg)
+        logger.info("Attended transfer REFER sent on call A with Replaces for call B (%s)",
+                     consult_call_id)
+
+        # Clean up — server will bridge A and B, then BYE both our legs
         self._stop_rtp()
         self.in_call = False
         self._call_id = ""
         self._held_call = None
         self._on_hold = False
+        self._hold_pending = False
         if self._on_call_state_change:
             self._on_call_state_change("SIP", "DISCONNECTED", "Transfer completed")
 
@@ -1189,8 +1268,12 @@ class SipHandler(ProtocolHandler):
         self._call_from_tag = held["call_from_tag"]
         self._call_to_tag = held["call_to_tag"]
         self._call_remote_uri = held["call_remote_uri"]
+        self._call_remote_tag = held.get("call_remote_tag", "")
+        self._call_direction = held.get("call_direction", "outbound")
+        self._incoming_from = held.get("incoming_from", "")
         self._rtp_session = held["rtp_session"]
         self._rtp_port = held["rtp_port"]
+        self._rtp_sdp_port = held.get("rtp_sdp_port", held["rtp_port"])
         self.in_call = True
         self._held_call = None
 
@@ -1293,8 +1376,10 @@ class SipHandler(ProtocolHandler):
         output_dev = self._audio_config.get("output_device", "")
         in_idx = int(input_dev) if input_dev not in ("", None) else None
         out_idx = int(output_dev) if output_dev not in ("", None) else None
+        stun_sock = getattr(self, '_rtp_stun_sock', None)
+        self._rtp_stun_sock = None  # Consume the socket
         self._rtp_session = RtpSession(self._rtp_port, input_device=in_idx,
-                                        output_device=out_idx)
+                                        output_device=out_idx, sock=stun_sock)
         actual_port = self._rtp_session.start(remote_ip, remote_port)
         self._rtp_port = actual_port
         logger.info("RTP session started: local=%d remote=%s:%d",
@@ -1610,8 +1695,7 @@ class SipHandler(ProtocolHandler):
                 self._handle_incoming_invite(headers, body, addr)
 
         elif method == "BYE":
-            # Remote hangup
-            # Send 200 OK
+            # Remote hangup — send 200 OK
             response = (
                 f"SIP/2.0 200 OK\r\n"
                 f"Via: {via_header}\r\n"
@@ -1623,12 +1707,18 @@ class SipHandler(ProtocolHandler):
                 f"\r\n"
             )
             self._send_sip(response)
-            self._stop_rtp()
-            self.in_call = False
-            self._call_id = ""
-            logger.info("SIP remote BYE received")
-            if self._on_call_state_change:
-                self._on_call_state_change("SIP", "DISCONNECTED", "Remote hangup")
+
+            if call_id == self._call_id:
+                # BYE for our active call
+                self._stop_rtp()
+                self.in_call = False
+                self._call_id = ""
+                logger.info("SIP remote BYE received")
+                if self._on_call_state_change:
+                    self._on_call_state_change("SIP", "DISCONNECTED", "Remote hangup")
+            else:
+                # BYE for a call we already cleaned up (e.g. after transfer)
+                logger.info("SIP BYE received for old call %s (already ended)", call_id)
 
         elif method == "NOTIFY":
             # BLF notification — send 200 OK
