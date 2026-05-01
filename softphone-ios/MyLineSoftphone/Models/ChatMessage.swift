@@ -18,6 +18,7 @@ struct ChatMessage: Codable, FetchableRecord, MutablePersistableRecord, Identifi
     var isOutgoing: Bool
     var timestamp: Date = Date()
     var status: MessageStatus = .sent
+    var messageType: String = "sms"   // "sms" or "whatsapp"
 
     mutating func didInsert(_ inserted: InsertionSuccess) {
         id = inserted.rowID

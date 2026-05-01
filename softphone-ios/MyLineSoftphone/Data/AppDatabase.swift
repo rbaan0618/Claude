@@ -57,6 +57,12 @@ final class AppDatabase {
             }
         }
 
+        migrator.registerMigration("v2") { db in
+            try db.alter(table: "chat_messages") { t in
+                t.add(column: "messageType", .text).notNull().defaults(to: "sms")
+            }
+        }
+
         return migrator
     }
 }
