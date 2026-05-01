@@ -535,21 +535,24 @@ class MainWindow:
         """Handle BLF presence changes."""
         self.root.after(0, lambda: self.blf_panel.update_state(extension, state))
 
-    def _on_message_received(self, protocol, from_user, body, timestamp):
+    def _on_message_received(self, protocol, from_user, body, timestamp,
+                             channel="sms"):
         """Handle an incoming SIP MESSAGE (RFC 3428)."""
         def _update():
-            self.messages_panel.on_incoming_message(from_user, body, timestamp)
-            self.status_var.set(f"New message from {from_user}")
+            self.messages_panel.on_incoming_message(from_user, body, timestamp,
+                                                    channel=channel)
+            ch_label = "WhatsApp" if channel == "whatsapp" else "SMS"
+            self.status_var.set(f"New {ch_label} from {from_user}")
         self.root.after(0, _update)
 
-    def _send_sip_message(self, peer, text):
+    def _send_sip_message(self, peer, text, channel="sms"):
         """Called by MessagesPanel to send an outbound SIP MESSAGE."""
         handler = self._active_handler()
         if not handler.registered:
             self.status_var.set("Not registered — cannot send message")
             return False
         try:
-            return bool(handler.send_message(peer, text))
+            return bool(handler.send_message(peer, text, channel=channel))
         except Exception as e:
             logger.error("send_message failed: %s", e)
             self.status_var.set(f"Message send failed: {e}")

@@ -1138,8 +1138,16 @@ class SipHandler(ProtocolHandler):
 
     # -- Out-of-dialog text messaging (RFC 3428) -----------------------------
 
-    def send_message(self, recipient: str, text: str) -> bool:
-        """Send a SIP MESSAGE (RFC 3428) to the given recipient."""
+    def send_message(self, recipient: str, text: str,
+                     channel: str = "sms") -> bool:
+        """Send a SIP MESSAGE (RFC 3428) to the given recipient.
+
+        Args:
+            recipient: phone number or SIP URI
+            text: message body (UTF-8)
+            channel: "sms" (default) or "whatsapp" — added as X-Channel header
+                     so the server-side bridge (sms_send.php) can route correctly
+        """
         if not self.registered or not self._server_addr:
             logger.warning("send_message: not registered")
             return False
@@ -1154,6 +1162,7 @@ class SipHandler(ProtocolHandler):
         from_uri = f'"{self._display_name}" <sip:{self._username}@{server}>'
         body = text or ""
         body_bytes = body.encode("utf-8")
+        chan = channel if channel in ("sms", "whatsapp") else "sms"
 
         msg = (
             f"MESSAGE {target_uri} SIP/2.0\r\n"
@@ -1164,6 +1173,7 @@ class SipHandler(ProtocolHandler):
             f"CSeq: 1 MESSAGE\r\n"
             f"Contact: {self._contact_header()}\r\n"
             f"Max-Forwards: 70\r\n"
+            f"X-Channel: {chan}\r\n"
             f"Content-Type: text/plain; charset=UTF-8\r\n"
             f"Content-Length: {len(body_bytes)}\r\n"
             f"\r\n"
@@ -1176,10 +1186,11 @@ class SipHandler(ProtocolHandler):
                                   f"Max-Forwards: 70\r\n{auth_line}\r\n")
         # Track for auth retry
         self._pending_messages[msg_call_id] = {
-            "recipient": recipient, "text": text, "auth_attempted": False,
+            "recipient": recipient, "text": text, "channel": chan,
+            "auth_attempted": False,
         }
         self._send_sip(msg)
-        logger.info("SIP MESSAGE sent to %s (%d bytes)", recipient, len(body_bytes))
+        logger.info("SIP MESSAGE [%s] sent to %s (%d bytes)", chan, recipient, len(body_bytes))
         return True
 
     # -- Attended transfer (consultation) ------------------------------------
@@ -1784,6 +1795,7 @@ class SipHandler(ProtocolHandler):
                                                         auth_header, header_name)
                     body = pending["text"] or ""
                     body_bytes = body.encode("utf-8")
+                    chan = pending.get("channel", "sms")
                     msg = (
                         f"MESSAGE {target_uri} SIP/2.0\r\n"
                         f"Via: {self._via_header()}\r\n"
@@ -1795,6 +1807,7 @@ class SipHandler(ProtocolHandler):
                         f"Contact: {self._contact_header()}\r\n"
                         f"Max-Forwards: 70\r\n"
                         f"{auth_line}\r\n"
+                        f"X-Channel: {chan}\r\n"
                         f"Content-Type: text/plain; charset=UTF-8\r\n"
                         f"Content-Length: {len(body_bytes)}\r\n"
                         f"\r\n"
@@ -1905,8 +1918,13 @@ class SipHandler(ProtocolHandler):
                 m = re.search(r"sip:([^@>;\s]+)@", from_header)
                 if m:
                     from_user = m.group(1)
+                # Read channel from X-Channel header (sms_send.php sets this too
+                # when delivering inbound messages through FusionPBX)
+                channel = headers.get("x-channel", "sms").strip().lower()
+                if channel not in ("sms", "whatsapp"):
+                    channel = "sms"
                 if self._on_message_received and body:
-                    self._on_message_received("SIP", from_user, body, time.time())
+                    self._on_message_received("SIP", from_user, body, time.time(), channel)
             except Exception as e:
                 logger.error("Error dispatching incoming MESSAGE: %s", e)
 
