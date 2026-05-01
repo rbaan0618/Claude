@@ -391,6 +391,10 @@ class SipHandler(ProtocolHandler):
         self._held_call = None  # dict with saved call state during consultation
         # BLF
         self._blf_subscriptions = {}
+        # Keepalive health tracking
+        self._pending_keepalives = 0  # incremented each send, cleared on any server response
+        # Outbound MESSAGE tracking (for 401 auth retry)
+        self._pending_messages = {}  # call_id -> {recipient, text, auth_attempted}
 
     @property
     def protocol_name(self) -> str:
@@ -1132,6 +1136,52 @@ class SipHandler(ProtocolHandler):
         self._send_sip(msg)
         logger.info("SIP REFER sent to transfer to %s", target)
 
+    # -- Out-of-dialog text messaging (RFC 3428) -----------------------------
+
+    def send_message(self, recipient: str, text: str) -> bool:
+        """Send a SIP MESSAGE (RFC 3428) to the given recipient."""
+        if not self.registered or not self._server_addr:
+            logger.warning("send_message: not registered")
+            return False
+        server, _ = self._server_addr
+        if not recipient.startswith("sip:"):
+            target_uri = f"sip:{recipient}@{server}"
+        else:
+            target_uri = recipient
+
+        msg_call_id = _generate_call_id()
+        from_tag = _generate_tag()
+        from_uri = f'"{self._display_name}" <sip:{self._username}@{server}>'
+        body = text or ""
+        body_bytes = body.encode("utf-8")
+
+        msg = (
+            f"MESSAGE {target_uri} SIP/2.0\r\n"
+            f"Via: {self._via_header()}\r\n"
+            f"From: {from_uri};tag={from_tag}\r\n"
+            f"To: <{target_uri}>\r\n"
+            f"Call-ID: {msg_call_id}\r\n"
+            f"CSeq: 1 MESSAGE\r\n"
+            f"Contact: {self._contact_header()}\r\n"
+            f"Max-Forwards: 70\r\n"
+            f"Content-Type: text/plain; charset=UTF-8\r\n"
+            f"Content-Length: {len(body_bytes)}\r\n"
+            f"\r\n"
+            f"{body}"
+        )
+        if self._auth_cached:
+            auth_line = self._build_cached_auth_header("MESSAGE", target_uri)
+            if auth_line:
+                msg = msg.replace("Max-Forwards: 70\r\n",
+                                  f"Max-Forwards: 70\r\n{auth_line}\r\n")
+        # Track for auth retry
+        self._pending_messages[msg_call_id] = {
+            "recipient": recipient, "text": text, "auth_attempted": False,
+        }
+        self._send_sip(msg)
+        logger.info("SIP MESSAGE sent to %s (%d bytes)", recipient, len(body_bytes))
+        return True
+
     # -- Attended transfer (consultation) ------------------------------------
 
     def consultation_call(self, target: str):
@@ -1440,6 +1490,8 @@ class SipHandler(ProtocolHandler):
 
         # --- Incoming request (INVITE, BYE, NOTIFY, etc) ---
         if method:
+            # Any inbound request proves the server can reach us
+            self._pending_keepalives = 0
             self._handle_request(method, headers, body, addr)
             return
 
@@ -1470,7 +1522,10 @@ class SipHandler(ProtocolHandler):
         elif "SUBSCRIBE" in cseq:
             self._handle_subscribe_response(status_code, headers, body, call_id)
         elif "OPTIONS" in cseq:
-            pass  # keepalive response — no action needed
+            # Server replied — it's alive, clear the pending counter
+            self._pending_keepalives = 0
+        elif "MESSAGE" in cseq:
+            self._handle_message_response(status_code, headers, body)
 
     def _extract_to_tag(self, headers):
         """Extract tag from To header."""
@@ -1702,6 +1757,58 @@ class SipHandler(ProtocolHandler):
         else:
             logger.info("SUBSCRIBE response: %d", status_code)
 
+    # Pending outbound MESSAGE tracking for auth retry
+    _pending_messages: dict  # call_id -> {"recipient": str, "text": str, "auth_attempted": bool}
+
+    def _handle_message_response(self, status_code, headers, body):
+        """Handle responses to outbound MESSAGE requests (RFC 3428)."""
+        call_id = headers.get("call-id", "")
+        if status_code == 200:
+            logger.debug("MESSAGE 200 OK (call-id=%s)", call_id)
+            self._pending_messages.pop(call_id, None)
+        elif status_code in (401, 407):
+            pending = self._pending_messages.get(call_id)
+            if pending and not pending.get("auth_attempted"):
+                pending["auth_attempted"] = True
+                auth_header = headers.get("www-authenticate") or headers.get("proxy-authenticate", "")
+                if isinstance(auth_header, list):
+                    auth_header = auth_header[0]
+                if auth_header and self._server_addr:
+                    server, _ = self._server_addr
+                    recipient = pending["recipient"]
+                    target_uri = (recipient if recipient.startswith("sip:")
+                                  else f"sip:{recipient}@{server}")
+                    header_name = ("Proxy-Authorization" if status_code == 407
+                                   else "Authorization")
+                    auth_line = self._build_auth_header("MESSAGE", target_uri,
+                                                        auth_header, header_name)
+                    body = pending["text"] or ""
+                    body_bytes = body.encode("utf-8")
+                    msg = (
+                        f"MESSAGE {target_uri} SIP/2.0\r\n"
+                        f"Via: {self._via_header()}\r\n"
+                        f"From: \"{self._display_name}\" "
+                        f"<sip:{self._username}@{server}>;tag={_generate_tag()}\r\n"
+                        f"To: <{target_uri}>\r\n"
+                        f"Call-ID: {call_id}\r\n"
+                        f"CSeq: 2 MESSAGE\r\n"
+                        f"Contact: {self._contact_header()}\r\n"
+                        f"Max-Forwards: 70\r\n"
+                        f"{auth_line}\r\n"
+                        f"Content-Type: text/plain; charset=UTF-8\r\n"
+                        f"Content-Length: {len(body_bytes)}\r\n"
+                        f"\r\n"
+                        f"{body}"
+                    )
+                    self._send_sip(msg)
+                    logger.info("MESSAGE re-sent with auth (call-id=%s)", call_id)
+            else:
+                logger.warning("MESSAGE %d — auth failed or no pending record", status_code)
+                self._pending_messages.pop(call_id, None)
+        else:
+            logger.warning("MESSAGE response: %d", status_code)
+            self._pending_messages.pop(call_id, None)
+
     def _handle_request(self, method, headers, body, addr):
         """Handle incoming SIP requests."""
         call_id = headers.get("call-id", "")
@@ -1771,7 +1878,7 @@ class SipHandler(ProtocolHandler):
                 f"Call-ID: {call_id}\r\n"
                 f"CSeq: {cseq}\r\n"
                 f"User-Agent: MyLineTelecom/1.0\r\n"
-                f"Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, NOTIFY, REFER\r\n"
+                f"Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, NOTIFY, REFER, MESSAGE\r\n"
                 f"Content-Length: 0\r\n"
                 f"\r\n"
             )
@@ -1779,6 +1886,29 @@ class SipHandler(ProtocolHandler):
 
         elif method == "ACK":
             pass  # ACK for our 200 OK to incoming INVITE
+
+        elif method == "MESSAGE":
+            # Incoming text message (RFC 3428) — ack with 200 OK and dispatch
+            response = (
+                f"SIP/2.0 200 OK\r\n"
+                f"Via: {via_header}\r\n"
+                f"From: {from_header}\r\n"
+                f"To: {to_header}\r\n"
+                f"Call-ID: {call_id}\r\n"
+                f"CSeq: {cseq}\r\n"
+                f"Content-Length: 0\r\n"
+                f"\r\n"
+            )
+            self._send_sip(response)
+            try:
+                from_user = ""
+                m = re.search(r"sip:([^@>;\s]+)@", from_header)
+                if m:
+                    from_user = m.group(1)
+                if self._on_message_received and body:
+                    self._on_message_received("SIP", from_user, body, time.time())
+            except Exception as e:
+                logger.error("Error dispatching incoming MESSAGE: %s", e)
 
         elif method == "CANCEL":
             # Respond 200 OK to CANCEL, then 487 to original INVITE
@@ -1939,6 +2069,7 @@ class SipHandler(ProtocolHandler):
     def _start_keepalive(self):
         """Start periodic OPTIONS keepalive pings."""
         self._stop_keepalive()
+        self._pending_keepalives = 0
         self._send_keepalive()
 
     def _stop_keepalive(self):
@@ -1947,9 +2078,32 @@ class SipHandler(ProtocolHandler):
             self._keepalive_timer = None
 
     def _send_keepalive(self):
-        """Send OPTIONS keepalive and schedule next."""
+        """Send OPTIONS keepalive and schedule next.
+
+        Tracks unanswered pings via _pending_keepalives.  If the server has
+        not replied to the last 2 consecutive keepalives the registration is
+        considered stale (NAT pinhole likely closed) and a fresh REGISTER is
+        triggered automatically — mirroring the Android keepalive logic.
+        """
         if not self._running or not self._server_addr or not self.registered:
             return
+
+        # Check if previous keepalives went unanswered
+        if self._pending_keepalives >= 2:
+            logger.warning(
+                "Keepalive: server silent for %d consecutive pings — "
+                "forcing re-registration", self._pending_keepalives)
+            self._pending_keepalives = 0
+            # Reset auth state so REGISTER starts fresh
+            self._auth_cached = False
+            threading.Thread(target=self._re_register, daemon=True).start()
+            # Schedule next keepalive after re-registration settles
+            self._keepalive_timer = threading.Timer(
+                self._keepalive_interval * 2, self._send_keepalive)
+            self._keepalive_timer.daemon = True
+            self._keepalive_timer.start()
+            return
+
         server, port = self._server_addr
         uri = f"sip:{server}:{port}"
         from_uri = f'"{self._display_name}" <sip:{self._username}@{server}>'
@@ -1969,8 +2123,9 @@ class SipHandler(ProtocolHandler):
             f"Content-Length: 0\r\n"
             f"\r\n"
         )
+        self._pending_keepalives += 1
         self._send_sip(msg)
-        logger.debug("SIP keepalive OPTIONS sent")
+        logger.debug("SIP keepalive OPTIONS sent (pending=%d)", self._pending_keepalives)
 
         # Schedule next keepalive
         self._keepalive_timer = threading.Timer(

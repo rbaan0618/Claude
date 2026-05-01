@@ -9,8 +9,10 @@ from datetime import datetime
 
 from gui.theme import get_theme
 from gui.dialpad import Dialpad
+from gui.in_call_view import InCallView
 from gui.blf_panel import BlfPanel
 from gui.contacts_panel import ContactsPanel
+from gui.messages_panel import MessagesPanel
 from gui.call_history import CallHistoryPanel
 from gui.settings_dialog import SettingsDialog
 from protocols.sip_handler import SipHandler
@@ -113,7 +115,7 @@ class MainWindow:
         left_content = tk.Frame(left_container, bg=c["bg_secondary"])
         left_content.pack(fill=tk.BOTH, expand=True)
 
-        for tab_name in ["Contacts", "BLF"]:
+        for tab_name in ["Contacts", "BLF", "Messages"]:
             btn = tk.Label(left_tab_bar, text=tab_name, font=("Segoe UI", 9),
                            bg=c["bg_secondary"], fg=c["fg"], cursor="hand2",
                            padx=12, pady=4)
@@ -145,23 +147,45 @@ class MainWindow:
         self.blf_panel.load_entries(blf_entries)
         self.blf_panel.bind("<<BlfAdded>>", lambda e: self._save_blf())
 
+        # Messages panel
+        self.messages_panel = MessagesPanel(
+            self._left_tab_frames["Messages"], theme_name=self.theme_name,
+            on_send=self._send_sip_message,
+        )
+        self.messages_panel.pack(fill=tk.BOTH, expand=True)
+
         self._switch_left_tab("Contacts")
 
-        # Center: Dialpad
-        center = tk.Frame(content, bg=c["bg"])
-        center.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
+        # Center: Dialpad <-> InCallView swap container
+        self._center = tk.Frame(content, bg=c["bg"])
+        self._center.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
 
-        self.dialpad = Dialpad(center, theme_name=self.theme_name,
+        self.dialpad = Dialpad(self._center, theme_name=self.theme_name,
                                on_call=self._make_call,
                                on_hangup=self._hangup,
                                on_dtmf=self._send_dtmf,
                                on_answer=self._answer_call)
         self.dialpad.pack(fill=tk.BOTH, expand=True)
 
-        # Mid-call events
+        # Mid-call events (still wired for the dialpad's mid-call buttons —
+        # left in place so existing keyboard / event flows keep working)
         self.dialpad.bind("<<MidCall-hold>>", lambda e: self._hold())
         self.dialpad.bind("<<MidCall-transfer>>", lambda e: self._transfer())
         self.dialpad.bind("<<MidCall-mute>>", lambda e: self._mute())
+
+        # In-call view (hidden until a call is active)
+        self.in_call_view = InCallView(
+            self._center, theme_name=self.theme_name,
+            on_hangup=self._hangup,
+            on_answer=self._answer_call,
+            on_hold=self._hold,
+            on_mute=self._mute,
+            on_transfer=self._transfer,
+            on_dtmf=self._send_dtmf,
+            on_complete_transfer=self._complete_transfer,
+            on_cancel_transfer=self._cancel_transfer,
+        )
+        self._in_call_visible = False
 
         # Right: Call history
         history_container = tk.Frame(content, bg=c["bg_secondary"], width=250)
@@ -199,6 +223,7 @@ class MainWindow:
             on_call_state_change=self._on_call_state_change,
             on_registration_state=self._on_registration_state,
             on_blf_state_change=self._on_blf_state_change,
+            on_message_received=self._on_message_received,
         )
 
         if sip_config.get("enabled", True):
@@ -238,6 +263,23 @@ class MainWindow:
                 daemon=True
             ).start()
 
+    # ---- View swap (dialpad <-> in-call) ----
+
+    def _show_in_call_view(self):
+        if self._in_call_visible:
+            return
+        self.dialpad.pack_forget()
+        self.in_call_view.pack(fill=tk.BOTH, expand=True)
+        self._in_call_visible = True
+
+    def _show_dialpad(self):
+        if not self._in_call_visible:
+            return
+        self.in_call_view.reset()
+        self.in_call_view.pack_forget()
+        self.dialpad.pack(fill=tk.BOTH, expand=True)
+        self._in_call_visible = False
+
     # ---- Call operations ----
 
     def _make_call(self, number):
@@ -253,7 +295,9 @@ class MainWindow:
         )
         if handler.make_call(number):
             self.status_var.set(f"Calling {number}...")
-            self.dialpad.caller_info_var.set(f"Calling: {number}")
+            self._show_in_call_view()
+            self.in_call_view.set_caller(number, number)
+            self.in_call_view.set_state("Calling...")
         else:
             self._current_call.status = "failed"
             self._current_call.end()
@@ -267,6 +311,8 @@ class MainWindow:
         if self._current_call:
             self._current_call.answer()
             self._start_call_timer()
+        self.in_call_view.hide_incoming()
+        self.in_call_view.set_state("Connected")
 
     def _hangup(self):
         handler = self._active_handler()
@@ -277,8 +323,7 @@ class MainWindow:
             self._save_call_record()
             self._current_call = None
         self.dialpad.hide_incoming()
-        self.dialpad.caller_info_var.set("")
-        self.dialpad.timer_var.set("")
+        self._show_dialpad()
         self.status_var.set("Ready")
 
     def _send_dtmf(self, digit):
@@ -291,15 +336,17 @@ class MainWindow:
         if self._transfer_in_progress:
             # Cancel transfer and resume original call
             self._cancel_transfer()
-            self.dialpad.set_hold_active(False)
+            self.in_call_view.set_hold_active(False)
             return
         if handler.on_hold:
             handler.unhold_call()
-            self.dialpad.set_hold_active(False)
+            self.in_call_view.set_hold_active(False)
+            self.in_call_view.set_state("Connected")
             self.status_var.set("Call resumed")
         else:
             handler.hold_call()
-            self.dialpad.set_hold_active(True)
+            self.in_call_view.set_hold_active(True)
+            self.in_call_view.set_state("On hold")
             self.status_var.set("Call on hold")
 
     def _transfer(self):
@@ -349,7 +396,7 @@ class MainWindow:
             self._transfer_in_progress = True
             handler.consultation_call(number)
             self.status_var.set(f"Consulting {number}... (original call on hold)")
-            self.dialpad.caller_info_var.set(f"Consulting: {number}")
+            self.in_call_view.show_consultation(number)
             dialog.destroy()
 
         entry.bind("<Return>", lambda e: _start_consultation())
@@ -371,7 +418,7 @@ class MainWindow:
         self._transfer_in_progress = False
         self._transfer_target = None
         self.status_var.set("Transfer completed")
-        self.dialpad.caller_info_var.set("")
+        self.in_call_view.clear_consultation()
 
     def _cancel_transfer(self):
         """Cancel transfer — hang up consultation call, resume original call."""
@@ -380,7 +427,8 @@ class MainWindow:
         self._transfer_in_progress = False
         self._transfer_target = None
         self.status_var.set("Transfer cancelled — call resumed")
-        self.dialpad.caller_info_var.set("Connected")
+        self.in_call_view.clear_consultation()
+        self.in_call_view.set_state("Connected")
 
     def _mute(self):
         handler = self._active_handler()
@@ -388,7 +436,7 @@ class MainWindow:
             return
         muted = not handler._rtp_session._muted
         handler._rtp_session.set_muted(muted)
-        self.dialpad.set_mute_active(muted)
+        self.in_call_view.set_mute_active(muted)
         self.status_var.set("Microphone muted" if muted else "Microphone unmuted")
 
     # ---- Callbacks from protocol handlers (called from background threads) ----
@@ -403,7 +451,9 @@ class MainWindow:
                 remote_name=remote_name,
             )
             display = f"{remote_name} <{remote_number}>" if remote_name else remote_number
-            self.dialpad.show_incoming(display)
+            self._show_in_call_view()
+            self.in_call_view.set_caller(remote_name or remote_number, remote_number)
+            self.in_call_view.show_incoming(display)
             self.status_var.set(f"Incoming {protocol} call: {display}")
             self._start_ringtone("incoming")
         self.root.after(0, _update)
@@ -415,15 +465,14 @@ class MainWindow:
                 self._stop_ringtone()
                 if self._transfer_in_progress:
                     # Consultation call answered — show transfer controls
-                    self.status_var.set("Consultation connected — Transfer or Hold to cancel")
-                    self.dialpad.caller_info_var.set(
-                        f"Consulting: {self._transfer_target}\n(Transfer=complete, Hold=cancel)")
+                    self.status_var.set("Consultation connected — use Complete/Cancel")
+                    self.in_call_view.show_consultation(self._transfer_target)
                     return
                 if self._current_call:
                     self._current_call.answer()
                 self._start_call_timer()
                 self.status_var.set(f"In call ({protocol})")
-                self.dialpad.caller_info_var.set("Connected")
+                self.in_call_view.set_state("Connected")
             elif state == "DISCONNECTED":
                 self._stop_ringtone()
                 if self._transfer_in_progress:
@@ -436,18 +485,18 @@ class MainWindow:
                     self._save_call_record()
                     self._current_call = None
                 self.dialpad.hide_incoming()
-                self.dialpad.caller_info_var.set("")
-                self.dialpad.timer_var.set("")
-                self.dialpad.set_mute_active(False)
-                self.dialpad.set_hold_active(False)
+                self._show_dialpad()
                 self.status_var.set(f"Call ended: {reason}")
             elif state == "RINGING":
                 self._start_ringtone("ringback")
                 self.status_var.set("Ringing...")
+                self.in_call_view.set_state("Ringing...")
             elif state == "HOLD":
                 self.status_var.set("On hold")
+                self.in_call_view.set_state("On hold")
             elif state == "CALLING":
                 self.status_var.set("Calling...")
+                self.in_call_view.set_state("Calling...")
             elif state in ("REJECTED", "BUSY"):
                 self._stop_ringtone()
                 if self._current_call:
@@ -455,6 +504,7 @@ class MainWindow:
                     self._current_call.end()
                     self._save_call_record()
                     self._current_call = None
+                self._show_dialpad()
                 self.status_var.set(f"Call {state.lower()}: {reason}")
         self.root.after(0, _update)
 
@@ -484,6 +534,26 @@ class MainWindow:
     def _on_blf_state_change(self, extension, state):
         """Handle BLF presence changes."""
         self.root.after(0, lambda: self.blf_panel.update_state(extension, state))
+
+    def _on_message_received(self, protocol, from_user, body, timestamp):
+        """Handle an incoming SIP MESSAGE (RFC 3428)."""
+        def _update():
+            self.messages_panel.on_incoming_message(from_user, body, timestamp)
+            self.status_var.set(f"New message from {from_user}")
+        self.root.after(0, _update)
+
+    def _send_sip_message(self, peer, text):
+        """Called by MessagesPanel to send an outbound SIP MESSAGE."""
+        handler = self._active_handler()
+        if not handler.registered:
+            self.status_var.set("Not registered — cannot send message")
+            return False
+        try:
+            return bool(handler.send_message(peer, text))
+        except Exception as e:
+            logger.error("send_message failed: %s", e)
+            self.status_var.set(f"Message send failed: {e}")
+            return False
 
     # ---- Ringtone ----
 
@@ -555,9 +625,10 @@ class MainWindow:
         mins, secs = divmod(elapsed, 60)
         hours, mins = divmod(mins, 60)
         if hours:
-            self.dialpad.timer_var.set(f"{hours:d}:{mins:02d}:{secs:02d}")
+            text = f"{hours:d}:{mins:02d}:{secs:02d}"
         else:
-            self.dialpad.timer_var.set(f"{mins:d}:{secs:02d}")
+            text = f"{mins:d}:{secs:02d}"
+        self.in_call_view.set_timer(text)
         self.root.after(1000, self._update_timer)
 
     # ---- Call record persistence ----

@@ -1,0 +1,52 @@
+{
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Read",
+      "Edit",
+      "Write",
+      "Glob",
+      "Grep",
+      "TodoWrite",
+      "Bash(python *)",
+      "Bash(python -c *)",
+      "Bash(py *)",
+      "Bash(pip install *)",
+      "Bash(pip show *)",
+      "Bash(pip list)",
+      "Bash(pyinstaller *)",
+      "Bash(pytest *)",
+      "Bash(pytest)",
+      "Bash(ls *)",
+      "Bash(ls)",
+      "Bash(wc *)",
+      "Bash(mkdir *)",
+      "Bash(git status)",
+      "Bash(git status *)",
+      "Bash(git diff)",
+      "Bash(git diff *)",
+      "Bash(git log)",
+      "Bash(git log *)",
+      "Bash(git show *)",
+      "Bash(git branch)",
+      "Bash(git branch *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git restore --staged *)",
+      "Bash(git stash)",
+      "Bash(git stash *)"
+    ],
+    "ask": [
+      "Bash(git push*)",
+      "Bash(git reset --hard*)",
+      "Bash(git checkout -- *)",
+      "Bash(git clean*)",
+      "Bash(git rebase*)",
+      "Bash(git merge*)",
+      "Bash(rm *)",
+      "Bash(del *)",
+      "Bash(rmdir *)",
+      "Bash(gh *)"
+    ]
+  }
+}

@@ -31,6 +31,18 @@ def _create_tables(conn):
             duration_seconds INTEGER DEFAULT 0
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            peer TEXT NOT NULL,
+            direction TEXT NOT NULL,       -- 'in' or 'out'
+            body TEXT NOT NULL,
+            timestamp REAL NOT NULL,
+            read INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_peer "
+                 "ON chat_messages(peer, timestamp)")
     conn.commit()
 
 
@@ -83,6 +95,80 @@ def clear_call_history():
     conn = get_connection()
     try:
         conn.execute("DELETE FROM call_history")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---- Chat messages (SIP MESSAGE) ----
+
+def add_chat_message(peer, direction, body, timestamp, read=0):
+    """Insert a chat message and return its ID."""
+    conn = get_connection()
+    try:
+        cursor = conn.execute("""
+            INSERT INTO chat_messages (peer, direction, body, timestamp, read)
+            VALUES (?, ?, ?, ?, ?)
+        """, (peer, direction, body, timestamp, read))
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def get_chats():
+    """Return per-peer summary: peer, last body, last timestamp, unread count."""
+    conn = get_connection()
+    try:
+        rows = conn.execute("""
+            SELECT peer,
+                   MAX(timestamp) AS last_ts,
+                   SUM(CASE WHEN read = 0 AND direction = 'in' THEN 1 ELSE 0 END) AS unread
+            FROM chat_messages
+            GROUP BY peer
+            ORDER BY last_ts DESC
+        """).fetchall()
+        result = []
+        for row in rows:
+            last = conn.execute(
+                "SELECT body, direction FROM chat_messages "
+                "WHERE peer = ? ORDER BY timestamp DESC LIMIT 1",
+                (row["peer"],)
+            ).fetchone()
+            result.append({
+                "peer": row["peer"],
+                "last_body": last["body"] if last else "",
+                "last_direction": last["direction"] if last else "",
+                "last_timestamp": row["last_ts"],
+                "unread": row["unread"] or 0,
+            })
+        return result
+    finally:
+        conn.close()
+
+
+def get_messages(peer, limit=500):
+    """Return all messages for a peer, oldest first."""
+    conn = get_connection()
+    try:
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM chat_messages WHERE peer = ? "
+            "ORDER BY timestamp ASC LIMIT ?",
+            (peer, limit)
+        ).fetchall()]
+    finally:
+        conn.close()
+
+
+def mark_chat_read(peer):
+    """Mark all inbound messages from peer as read."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE chat_messages SET read = 1 "
+            "WHERE peer = ? AND direction = 'in'",
+            (peer,)
+        )
         conn.commit()
     finally:
         conn.close()

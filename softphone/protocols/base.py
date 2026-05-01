@@ -14,17 +14,20 @@ class ProtocolHandler(ABC):
         self._on_call_state_change = None
         self._on_registration_state = None
         self._on_blf_state_change = None
+        self._on_message_received = None
 
     def set_callbacks(self,
                       on_incoming_call: Optional[Callable] = None,
                       on_call_state_change: Optional[Callable] = None,
                       on_registration_state: Optional[Callable] = None,
-                      on_blf_state_change: Optional[Callable] = None):
+                      on_blf_state_change: Optional[Callable] = None,
+                      on_message_received: Optional[Callable] = None):
         """Set event callbacks for the GUI to receive updates."""
         self._on_incoming_call = on_incoming_call
         self._on_call_state_change = on_call_state_change
         self._on_registration_state = on_registration_state
         self._on_blf_state_change = on_blf_state_change
+        self._on_message_received = on_message_received
 
     @abstractmethod
     def initialize(self, config: dict) -> bool:

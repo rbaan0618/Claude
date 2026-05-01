@@ -1,7 +1,30 @@
 """Dialpad widget with number display and call controls."""
 
 import tkinter as tk
+import threading
+try:
+    import winsound
+    _WINSOUND = True
+except ImportError:
+    _WINSOUND = False
+
 from gui.theme import get_theme
+
+# DTMF row frequencies (Hz) — gives subtle pitch variation per row
+_DTMF_FREQ = {
+    "1": 697, "2": 697, "3": 697,
+    "4": 770, "5": 770, "6": 770,
+    "7": 852, "8": 852, "9": 852,
+    "*": 941, "0": 941, "#": 941,
+}
+
+
+def _play_dtmf_tone(digit):
+    """Play a short DTMF feedback beep in a background thread."""
+    if not _WINSOUND:
+        return
+    freq = _DTMF_FREQ.get(str(digit), 941)
+    threading.Thread(target=winsound.Beep, args=(freq, 60), daemon=True).start()
 
 
 class Dialpad(tk.Frame):
@@ -31,8 +54,18 @@ class Dialpad(tk.Frame):
             bg=c["bg_input"], fg=c["fg"], insertbackground=c["fg"],
             relief=tk.FLAT, bd=8
         )
-        self.display.pack(fill=tk.X)
+        self.display.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.display.bind("<Return>", lambda e: self._dial())
+        self.display.bind("<Control-v>", lambda e: self._paste_from_clipboard())
+        self.display.bind("<Button-3>", lambda e: self._show_context_menu(e))
+
+        # Paste icon button (📋) — always visible, one-click paste
+        paste_btn = tk.Label(
+            display_frame, text="\U0001f4cb", font=("Segoe UI", 14),
+            bg=c["bg_input"], fg=c["fg_dim"], cursor="hand2", padx=4
+        )
+        paste_btn.pack(side=tk.LEFT)
+        paste_btn.bind("<Button-1>", lambda e: self._paste_from_clipboard())
 
         # Caller info label (shown during incoming calls)
         self.caller_info_var = tk.StringVar()
@@ -137,6 +170,7 @@ class Dialpad(tk.Frame):
             self._mid_buttons[cmd] = btn
 
     def _press(self, digit):
+        _play_dtmf_tone(digit)
         self.number_var.set(self.number_var.get() + digit)
         if self._on_dtmf:
             self._on_dtmf(digit)
@@ -197,3 +231,33 @@ class Dialpad(tk.Frame):
 
     def set_number(self, number):
         self.number_var.set(number)
+
+    def _paste_from_clipboard(self):
+        """Paste clipboard text into the number display (digits/+/* only)."""
+        try:
+            text = self.display.clipboard_get()
+            # Keep only characters valid in a phone number
+            cleaned = "".join(ch for ch in text if ch.isdigit() or ch in "+*#")
+            if cleaned:
+                self.number_var.set(self.number_var.get() + cleaned)
+        except tk.TclError:
+            pass  # Clipboard empty or non-text
+
+    def _show_context_menu(self, event):
+        """Right-click context menu on the number display."""
+        c = self.colors
+        menu = tk.Menu(self, tearoff=0, bg=c["bg_secondary"], fg=c["fg"],
+                       activebackground=c["accent"], activeforeground="#ffffff",
+                       relief=tk.FLAT, bd=0)
+        menu.add_command(label="Paste", command=self._paste_from_clipboard)
+        menu.add_command(label="Copy",
+                         command=lambda: (
+                             self.display.clipboard_clear(),
+                             self.display.clipboard_append(self.number_var.get())
+                         ))
+        menu.add_separator()
+        menu.add_command(label="Clear", command=lambda: self.number_var.set(""))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
