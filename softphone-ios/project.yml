@@ -1,0 +1,67 @@
+# XcodeGen spec. On a Mac: `brew install xcodegen && xcodegen generate` to produce MyLineSoftphone.xcodeproj
+name: MyLineSoftphone
+options:
+  bundleIdPrefix: com.mylinetelecom
+  deploymentTarget:
+    iOS: "15.0"
+  developmentLanguage: en
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_BITCODE: NO
+    TARGETED_DEVICE_FAMILY: "1,2"
+    CLANG_ENABLE_MODULES: YES
+    SWIFT_OBJC_BRIDGING_HEADER: MyLineSoftphone/BCG729-Bridging-Header.h
+
+packages:
+  GRDB:
+    url: https://github.com/groue/GRDB.swift
+    from: "6.29.0"
+
+targets:
+  MyLineSoftphone:
+    type: application
+    platform: iOS
+    sources:
+      - path: MyLineSoftphone
+        excludes:
+          - "**/*.md"
+    info:
+      path: MyLineSoftphone/Info.plist
+      properties:
+        CFBundleDisplayName: My Line Telecom
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UIBackgroundModes:
+          - audio
+          - voip
+          - remote-notification
+        NSMicrophoneUsageDescription: Microphone access is required to make and receive SIP voice calls.
+        NSLocalNetworkUsageDescription: Local network access is required to communicate with your SIP server.
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.mylinetelecom.softphone
+        CODE_SIGN_STYLE: Automatic
+        INFOPLIST_FILE: MyLineSoftphone/Info.plist
+        SWIFT_OBJC_BRIDGING_HEADER: MyLineSoftphone/BCG729-Bridging-Header.h
+    dependencies:
+      - sdk: CallKit.framework
+      - sdk: PushKit.framework
+      - sdk: AVFoundation.framework
+      - sdk: Network.framework
+      - package: GRDB
+    entitlements:
+      path: MyLineSoftphone/MyLineSoftphone.entitlements
+      properties:
+        com.apple.developer.networking.multicast: false
+        aps-environment: development
