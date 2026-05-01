@@ -6,8 +6,8 @@ struct MyLineSoftphoneApp: App {
     @StateObject private var service = SipService.shared
 
     init() {
-        // Ensure DB is created up front so DAOs can observe immediately.
         _ = AppDatabase.shared
+        SipService.requestNotificationPermission()
     }
 
     var body: some Scene {
