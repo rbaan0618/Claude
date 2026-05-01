@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">My Line Telecom</string>
+    <string name="notification_channel_call">Active Call</string>
+    <string name="notification_channel_service">SIP Service</string>
+    <string name="notification_channel_message">Messages</string>
+    <string name="notification_incoming_call">Incoming call from %1$s</string>
+    <string name="notification_active_call">Call in progress with %1$s</string>
+    <string name="notification_registered">Registered to %1$s</string>
+    <string name="action_answer">Answer</string>
+    <string name="action_decline">Decline</string>
+    <string name="action_hangup">Hang Up</string>
+
+    <!-- Navigation Labels -->
+    <string name="nav_dialpad">Dialpad</string>
+    <string name="nav_contacts">Contacts</string>
+    <string name="nav_history">History</string>
+    <string name="nav_blf">BLF</string>
+</resources>

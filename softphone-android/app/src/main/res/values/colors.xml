@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Brand colors -->
+    <color name="brand_primary">#1E88E5</color>
+    <color name="brand_dark">#1565C0</color>
+
+    <!-- Dark theme -->
+    <color name="dark_background">#1E1E2E</color>
+    <color name="dark_surface">#313244</color>
+    <color name="dark_surface_variant">#45475A</color>
+    <color name="dark_text">#CDD6F4</color>
+    <color name="dark_subtext">#A6ADC8</color>
+
+    <!-- Call colors -->
+    <color name="call_green">#4CAF50</color>
+    <color name="call_red">#F44336</color>
+    <color name="call_orange">#FF9800</color>
+    <color name="hold_color">#FF5722</color>
+    <color name="mute_color">#F44336</color>
+
+    <!-- BLF states -->
+    <color name="blf_idle">#4CAF50</color>
+    <color name="blf_ringing">#FF9800</color>
+    <color name="blf_busy">#F44336</color>
+    <color name="blf_unknown">#9E9E9E</color>
+    <color name="blf_offline">#616161</color>
+</resources>
