@@ -25,6 +25,20 @@ workflows:
             -scheme "$XCODE_SCHEME"
       - name: Set up code signing
         script: xcode-project use-profiles
+      - name: Create ExportOptions.plist
+        script: |
+          cat > /tmp/ExportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>teamID</key>
+            <string>5PWNU336CJ</string>
+          </dict>
+          </plist>
+          EOF
       - name: Build and archive
         script: |
           mkdir -p /tmp/xcodebuild_logs
@@ -36,6 +50,14 @@ workflows:
             CODE_SIGN_STYLE=Manual \
             DEVELOPMENT_TEAM=5PWNU336CJ \
             archive 2>&1 | tee /tmp/xcodebuild_logs/archive.log; exit ${PIPESTATUS[0]}
+      - name: Export IPA
+        script: |
+          mkdir -p build/ios/ipa
+          xcodebuild -exportArchive \
+            -archivePath build/MyLineSoftphone.xcarchive \
+            -exportPath build/ios/ipa \
+            -exportOptionsPlist /tmp/ExportOptions.plist \
+            2>&1 | tee /tmp/xcodebuild_logs/export.log; exit ${PIPESTATUS[0]}
     artifacts:
       - build/ios/ipa/*.ipa
       - /tmp/xcodebuild_logs/*.log
