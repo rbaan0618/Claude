@@ -23,6 +23,8 @@ workflows:
           xcodebuild -resolvePackageDependencies \
             -project "$XCODE_PROJECT" \
             -scheme "$XCODE_SCHEME"
+      - name: Set up code signing
+        script: xcode-project use-profiles
       - name: Build and archive
         script: |
           xcode-project build-ipa \
