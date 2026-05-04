@@ -64,5 +64,4 @@ targets:
     entitlements:
       path: MyLineSoftphone/MyLineSoftphone.entitlements
       properties:
-        com.apple.developer.networking.multicast: false
         aps-environment: production
