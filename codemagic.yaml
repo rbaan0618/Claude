@@ -36,6 +36,13 @@ workflows:
             <string>app-store-connect</string>
             <key>teamID</key>
             <string>5PWNU336CJ</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>com.mylinetelecom.softphone</key>
+              <string>MyLine Softphone Appstore</string>
+            </dict>
           </dict>
           </plist>
           EOF
