@@ -73,6 +73,7 @@ workflows:
     publishing:
       app_store_connect:
         auth: integration
+        submit_to_testflight: true
 
   ios-app-preview:
     name: MyLine iOS App Preview (Simulator)
