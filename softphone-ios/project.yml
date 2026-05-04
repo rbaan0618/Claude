@@ -51,7 +51,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.mylinetelecom.softphone
-        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_STYLE: Manual
+        DEVELOPMENT_TEAM: 5PWNU336CJ
         INFOPLIST_FILE: MyLineSoftphone/Info.plist
         SWIFT_OBJC_BRIDGING_HEADER: MyLineSoftphone/BCG729-Bridging-Header.h
     dependencies:
@@ -64,4 +65,4 @@ targets:
       path: MyLineSoftphone/MyLineSoftphone.entitlements
       properties:
         com.apple.developer.networking.multicast: false
-        aps-environment: development
+        aps-environment: production
