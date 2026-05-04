@@ -27,6 +27,7 @@ workflows:
         script: xcode-project use-profiles
       - name: Build and archive
         script: |
+          mkdir -p /tmp/xcodebuild_logs
           xcodebuild \
             -project "$XCODE_PROJECT" \
             -scheme "$XCODE_SCHEME" \

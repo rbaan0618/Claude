@@ -55,6 +55,7 @@ targets:
         DEVELOPMENT_TEAM: 5PWNU336CJ
         INFOPLIST_FILE: MyLineSoftphone/Info.plist
         SWIFT_OBJC_BRIDGING_HEADER: MyLineSoftphone/BCG729-Bridging-Header.h
+        HEADER_SEARCH_PATHS: $(SRCROOT)/MyLineSoftphone/Codecs
     dependencies:
       - sdk: CallKit.framework
       - sdk: PushKit.framework
