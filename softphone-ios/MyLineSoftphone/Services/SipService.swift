@@ -30,6 +30,7 @@ final class SipService: NSObject, ObservableObject {
     private let provider: CXProvider
     private let callController = CXCallController()
     private var activeCallUUID: UUID?
+    private var isOutgoingCall: Bool = false
 
     // PushKit
     private let pushRegistry = PKPushRegistry(queue: .main)
@@ -103,6 +104,7 @@ final class SipService: NSObject, ObservableObject {
     func startOutgoingCall(number: String) {
         let uuid = UUID()
         activeCallUUID = uuid
+        isOutgoingCall = true
         let handle = CXHandle(type: .phoneNumber, value: number)
         let action = CXStartCallAction(call: uuid, handle: handle)
         let transaction = CXTransaction(action: action)
@@ -122,7 +124,7 @@ final class SipService: NSObject, ObservableObject {
         case .incoming:
             reportIncomingCall(number: number, name: name)
         case .confirmed:
-            if let uuid = activeCallUUID {
+            if let uuid = activeCallUUID, isOutgoingCall {
                 provider.reportOutgoingCall(with: uuid, connectedAt: Date())
             }
         case .disconnected, .rejected, .busy:
@@ -138,6 +140,7 @@ final class SipService: NSObject, ObservableObject {
     private func reportIncomingCall(number: String, name: String) {
         let uuid = UUID()
         activeCallUUID = uuid
+        isOutgoingCall = false
         let update = CXCallUpdate()
         update.remoteHandle = CXHandle(type: .phoneNumber, value: number)
         update.localizedCallerName = name.isEmpty ? number : name

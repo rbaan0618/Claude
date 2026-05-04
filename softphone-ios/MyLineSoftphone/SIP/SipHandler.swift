@@ -445,16 +445,24 @@ final class SipHandler: ObservableObject {
         ioQueue.async { [weak self] in self?.rtpSession?.sendDtmf(digit) }
     }
 
-    func sendMessage(to recipient: String, text: String) {
+    func sendMessage(to recipient: String, text: String, messageType: String = "sms") {
         ioQueue.async { [weak self] in
             guard let self, self.registrationState == .registered else { return }
+            // Route by channel: WhatsApp numbers keep the '+' prefix so the server
+            // recognises them as WhatsApp. SMS numbers must NOT have a '+' prefix.
+            let routedRecipient: String
+            if messageType == "whatsapp" {
+                routedRecipient = recipient.hasPrefix("+") ? recipient : "+\(recipient)"
+            } else {
+                routedRecipient = recipient.hasPrefix("+") ? String(recipient.dropFirst()) : recipient
+            }
             let msgCallId = self.generateCallId()
             let fromTag = self.generateTag()
             let contactAddr = self.contactAddress()
             let req = self.buildRequest(
                 method: "MESSAGE",
-                requestUri: "sip:\(recipient)@\(self.config.domain)",
-                toUri: "sip:\(recipient)@\(self.config.domain)",
+                requestUri: "sip:\(routedRecipient)@\(self.config.domain)",
+                toUri: "sip:\(routedRecipient)@\(self.config.domain)",
                 fromUri: "sip:\(self.config.username)@\(self.config.domain)",
                 callId: msgCallId,
                 cseq: 1,
@@ -468,7 +476,7 @@ final class SipHandler: ObservableObject {
                 viaBranch: nil
             )
             self.sendSip(req)
-            Self.log.info("Sent MESSAGE to \(recipient, privacy: .public)")
+            Self.log.info("Sent \(messageType) MESSAGE to \(routedRecipient, privacy: .public)")
         }
     }
 

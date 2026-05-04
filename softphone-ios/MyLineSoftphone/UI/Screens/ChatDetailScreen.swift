@@ -93,7 +93,7 @@ struct ChatDetailScreen: View {
     private func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        service.sipHandler.sendMessage(to: remoteNumber, text: text)
+        service.sipHandler.sendMessage(to: remoteNumber, text: text, messageType: messageType)
         let msg = ChatMessage(remoteNumber: remoteNumber, body: text,
                               isOutgoing: true, timestamp: Date(),
                               status: .sent, messageType: messageType)
