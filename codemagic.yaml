@@ -7,7 +7,7 @@ workflows:
       app_store_connect: Softphone_IOS
     environment:
       ios_signing:
-        distribution_type: app_store
+        distribution_type: ad_hoc
         bundle_identifier: com.mylinetelecom.softphone
       vars:
         XCODE_SCHEME: MyLineSoftphone
@@ -43,6 +43,3 @@ workflows:
     publishing:
       app_store_connect:
         auth: integration
-        submit_to_testflight: true
-        beta_groups:
-          - Internal Testers
