@@ -46,3 +46,35 @@ workflows:
         submit_to_testflight: true
         beta_groups:
           - Internal Testers
+
+  ios-app-preview:
+    name: MyLine iOS App Preview (Simulator)
+    max_build_duration: 60
+    instance_type: mac_mini_m2
+    environment:
+      vars:
+        XCODE_SCHEME: MyLineSoftphone
+        XCODE_PROJECT: softphone-ios/MyLineSoftphone.xcodeproj
+      xcode: latest
+    scripts:
+      - name: Install XcodeGen
+        script: brew install xcodegen
+      - name: Generate Xcode project
+        script: cd softphone-ios && xcodegen generate
+      - name: Resolve Swift packages
+        script: |
+          xcodebuild -resolvePackageDependencies \
+            -project "$XCODE_PROJECT" \
+            -scheme "$XCODE_SCHEME"
+      - name: Build for simulator
+        script: |
+          xcodebuild build \
+            -project "$XCODE_PROJECT" \
+            -scheme "$XCODE_SCHEME" \
+            -sdk iphonesimulator \
+            -destination "generic/platform=iOS Simulator" \
+            -derivedDataPath build/simulator \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO
+    artifacts:
+      - build/simulator/Build/Products/Debug-iphonesimulator/*.app
