@@ -427,10 +427,14 @@ extension SipService: PKPushRegistryDelegate {
     nonisolated func pushRegistry(_ registry: PKPushRegistry,
                                   didUpdate pushCredentials: PKPushCredentials,
                                   for type: PKPushType) {
-        // TODO: Upload `pushCredentials.token` to your SIP push bridge so it can
-        // send an APNs VoIP push when the server has an incoming INVITE for us.
         let token = pushCredentials.token.map { String(format: "%02x", $0) }.joined()
         Self.log.info("VoIP push token: \(token, privacy: .public)")
+        // Pass the token to SipHandler so it is included in every REGISTER request
+        // as X-Push-Token. FreeSWITCH stores it alongside the registration and uses
+        // it to wake the app via APNs when an INVITE arrives while we are suspended.
+        Task { @MainActor in
+            self.sipHandler.setVoipPushToken(token)
+        }
     }
 
     nonisolated func pushRegistry(_ registry: PKPushRegistry,

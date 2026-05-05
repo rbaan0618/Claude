@@ -136,6 +136,26 @@ final class SipHandler: ObservableObject {
     private var stopping = false
     private var restarting = false
 
+    // MARK: - VoIP push token
+
+    /// Hex push token supplied by PushKit. Included as X-Push-Token in every
+    /// REGISTER so the server can store it and wake the app via APNs when an
+    /// INVITE arrives while the app is backgrounded / suspended.
+    private var voipPushToken: String = ""
+
+    func setVoipPushToken(_ token: String) {
+        ioQueue.async { [weak self] in
+            guard let self else { return }
+            self.voipPushToken = token
+            // Re-register immediately so the server learns the token without
+            // waiting for the next scheduled re-register.
+            if self.registrationState == .registered {
+                self.registerCseq += 1
+                self.sendRegisterWithCurrentAuth()
+            }
+        }
+    }
+
     // MARK: - Public API
 
     func configure(_ sipConfig: SipConfig) {
@@ -1316,6 +1336,14 @@ final class SipHandler: ObservableObject {
         registerFromTag = generateTag()
         registerCseq = 1
         let contactAddr = contactAddress()
+        var headers: [(String, String)] = [
+            ("Contact", "<sip:\(config.username)@\(contactAddr);transport=\(config.transport.lowercased())>"),
+            ("Expires", String(Self.registerExpiresSeconds)),
+        ]
+        if !voipPushToken.isEmpty {
+            headers.append(("X-Push-Token", voipPushToken))
+            headers.append(("X-Push-Type", "apple"))
+        }
         let req = buildRequest(
             method: "REGISTER",
             requestUri: "sip:\(config.domain)",
@@ -1325,10 +1353,7 @@ final class SipHandler: ObservableObject {
             cseq: registerCseq,
             fromTag: registerFromTag,
             toTag: "",
-            extraHeaders: [
-                ("Contact", "<sip:\(config.username)@\(contactAddr);transport=\(config.transport.lowercased())>"),
-                ("Expires", String(Self.registerExpiresSeconds)),
-            ],
+            extraHeaders: headers,
             body: "",
             viaBranch: nil
         )
@@ -1362,11 +1387,21 @@ final class SipHandler: ObservableObject {
         sendSip(req)
     }
 
-    private func registerWithAuth(isProxy: Bool) {
-        registerCseq += 1
+    /// Re-sends a REGISTER preserving any existing auth credentials and the
+    /// current push token. Used when the push token arrives after initial registration.
+    private func sendRegisterWithCurrentAuth() {
         let contactAddr = contactAddress()
-        let authHeader = buildAuthHeader(method: "REGISTER", uri: "sip:\(config.domain)")
-        let headerName = isProxy ? "Proxy-Authorization" : "Authorization"
+        var headers: [(String, String)] = [
+            ("Contact", "<sip:\(config.username)@\(contactAddr);transport=\(config.transport.lowercased())>"),
+            ("Expires", String(Self.registerExpiresSeconds)),
+        ]
+        if !authNonce.isEmpty {
+            headers.append(("Authorization", buildAuthHeader(method: "REGISTER", uri: "sip:\(config.domain)")))
+        }
+        if !voipPushToken.isEmpty {
+            headers.append(("X-Push-Token", voipPushToken))
+            headers.append(("X-Push-Type", "apple"))
+        }
         let req = buildRequest(
             method: "REGISTER",
             requestUri: "sip:\(config.domain)",
@@ -1376,11 +1411,37 @@ final class SipHandler: ObservableObject {
             cseq: registerCseq,
             fromTag: registerFromTag,
             toTag: "",
-            extraHeaders: [
-                ("Contact", "<sip:\(config.username)@\(contactAddr);transport=\(config.transport.lowercased())>"),
-                ("Expires", String(Self.registerExpiresSeconds)),
-                (headerName, authHeader),
-            ],
+            extraHeaders: headers,
+            body: "",
+            viaBranch: nil
+        )
+        sendSip(req)
+    }
+
+    private func registerWithAuth(isProxy: Bool) {
+        registerCseq += 1
+        let contactAddr = contactAddress()
+        let authHeader = buildAuthHeader(method: "REGISTER", uri: "sip:\(config.domain)")
+        let headerName = isProxy ? "Proxy-Authorization" : "Authorization"
+        var headers: [(String, String)] = [
+            ("Contact", "<sip:\(config.username)@\(contactAddr);transport=\(config.transport.lowercased())>"),
+            ("Expires", String(Self.registerExpiresSeconds)),
+            (headerName, authHeader),
+        ]
+        if !voipPushToken.isEmpty {
+            headers.append(("X-Push-Token", voipPushToken))
+            headers.append(("X-Push-Type", "apple"))
+        }
+        let req = buildRequest(
+            method: "REGISTER",
+            requestUri: "sip:\(config.domain)",
+            toUri: "sip:\(config.username)@\(config.domain)",
+            fromUri: "sip:\(config.username)@\(config.domain)",
+            callId: registerCallId,
+            cseq: registerCseq,
+            fromTag: registerFromTag,
+            toTag: "",
+            extraHeaders: headers,
             body: "",
             viaBranch: nil
         )
