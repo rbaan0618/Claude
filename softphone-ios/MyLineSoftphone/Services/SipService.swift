@@ -26,8 +26,9 @@ final class SipService: NSObject, ObservableObject {
 
     let sipHandler = SipHandler()
 
-    // Republished so ContentView (which observes SipService) re-renders on call state changes.
+    // Republished so ContentView (which observes SipService) re-renders on call/registration changes.
     @Published private(set) var callState: CallState = .idle
+    @Published private(set) var registrationState: RegistrationState = .unregistered
 
     // CallKit
     private let provider: CXProvider
@@ -57,6 +58,13 @@ final class SipService: NSObject, ObservableObject {
         sipHandler.onCallStateChanged = { [weak self] state, number, name in
             Task { @MainActor in
                 self?.handleCallStateChanged(state: state, number: number, name: name)
+            }
+        }
+
+        // Forward registration state so SettingsScreen re-renders.
+        sipHandler.onRegistrationChanged = { [weak self] state in
+            Task { @MainActor in
+                self?.registrationState = state
             }
         }
 
@@ -108,6 +116,9 @@ final class SipService: NSObject, ObservableObject {
         let uuid = UUID()
         activeCallUUID = uuid
         isOutgoingCall = true
+        // Immediately update callState so ContentView shows InCallScreen right away
+        // before the async CallKit transaction completes.
+        callState = .calling
         let handle = CXHandle(type: .phoneNumber, value: number)
         let action = CXStartCallAction(call: uuid, handle: handle)
         let transaction = CXTransaction(action: action)

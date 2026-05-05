@@ -28,7 +28,7 @@ struct SettingsScreen: View {
                     Toggle("rport", isOn: $config.rport)
                 }
                 Section("Status") {
-                    LabeledContent("Registration", value: service.sipHandler.registrationState.rawValue.capitalized)
+                    LabeledContent("Registration", value: service.registrationState.rawValue.capitalized)
                 }
                 Section {
                     Button("Save & Reconnect") {
