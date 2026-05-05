@@ -47,9 +47,12 @@ final class SipService: NSObject, ObservableObject {
     // Busy tone played locally when the remote party is busy.
     private var busyPlayer: AVAudioPlayer?
 
-    // Background task identifier — keeps the process alive ~30 s after backgrounding
-    // so the keepalive OPTIONS can still reach the server before iOS suspends us.
-    private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+    // Silent audio engine — keeps the process alive in the background exactly
+    // like Android's foreground VoIP service.  UIBackgroundModes:audio tells
+    // iOS "don't suspend this app"; a zero-filled looping buffer costs no CPU
+    // and produces no audible sound.
+    private var silentEngine: AVAudioEngine?
+    private var silentNode:   AVAudioPlayerNode?
 
     override init() {
         let config = CXProviderConfiguration()
@@ -123,35 +126,69 @@ final class SipService: NSObject, ObservableObject {
     // MARK: - App lifecycle (background / foreground)
 
     /// Call when `scenePhase` becomes `.background`.
-    /// Requests ~30 s of extra execution time so keepalive OPTIONS packets
-    /// can still be sent before iOS suspends the process.
+    /// Starts a silent audio loop that prevents iOS from suspending the process,
+    /// keeping the UDP socket open and the keepalive timer running — the same
+    /// role Android's foreground VoIP service plays.
     func handleAppBackground() {
-        guard backgroundTaskID == .invalid else { return }
-        backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "SIPKeepalive") { [weak self] in
-            // Expiry handler — iOS is about to force-suspend; release the task.
-            Self.log.warning("Background task expired — SIP keepalive will stop")
-            self?.endBackgroundTask()
-        }
-        Self.log.info("Background task started (id=\(self.backgroundTaskID.rawValue))")
+        startSilentAudio()
     }
 
     /// Call when `scenePhase` becomes `.active`.
-    /// Ends the background task and re-registers if the SIP stack died while suspended.
+    /// Stops the silent audio (no longer needed) and re-registers if the SIP
+    /// stack somehow dropped while we were in the background.
     func handleAppForeground() {
-        endBackgroundTask()
+        stopSilentAudio()
 
-        // If registration dropped while we were suspended, restart the stack.
         guard registrationState != .registered && registrationState != .registering else { return }
         let config = SettingsRepository.shared.load()
         guard config.isValid else { return }
-        Self.log.info("App foregrounded with lost registration — restarting SIP stack")
+        Self.log.info("App foregrounded — restarting SIP stack after background loss")
         sipHandler.restartForNetworkChange()
     }
 
-    private func endBackgroundTask() {
-        guard backgroundTaskID != .invalid else { return }
-        UIApplication.shared.endBackgroundTask(backgroundTaskID)
-        backgroundTaskID = .invalid
+    // MARK: - Silent background audio (VoIP keepalive)
+
+    /// Plays a zero-filled audio loop so iOS keeps the process alive
+    /// indefinitely under UIBackgroundModes:audio.  Costs ~0 CPU / battery.
+    private func startSilentAudio() {
+        guard silentEngine == nil else { return }
+
+        let engine = AVAudioEngine()
+        let node   = AVAudioPlayerNode()
+        engine.attach(node)
+
+        // 8 kHz mono — same rate as our codec, tiny buffer footprint.
+        guard let format = AVAudioFormat(standardFormatWithSampleChannelCount: 1,
+                                         sampleRate: 8000) else { return }
+        engine.connect(node, to: engine.mainMixerNode, format: format)
+
+        // One second of silence, looped forever.
+        let frameCount: AVAudioFrameCount = 8000
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format,
+                                            frameCapacity: frameCount) else { return }
+        buffer.frameLength = frameCount
+        // floatChannelData is zero-initialised — no fill needed.
+
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default,
+                                                            options: .mixWithOthers)
+            try AVAudioSession.sharedInstance().setActive(true)
+            try engine.start()
+            node.scheduleBuffer(buffer, at: nil, options: .loops)
+            node.play()
+            silentEngine = engine
+            silentNode   = node
+            Self.log.info("Background silent audio started — SIP stack will stay alive")
+        } catch {
+            Self.log.warning("Silent audio failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func stopSilentAudio() {
+        silentNode?.stop()
+        silentEngine?.stop()
+        silentEngine = nil
+        silentNode   = nil
     }
 
     // MARK: - Outbound calls via CallKit
@@ -408,15 +445,22 @@ extension SipService: CXProviderDelegate {
     /// CallKit has activated the shared audio session — safe to start RTP audio now.
     nonisolated func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
         Task { @MainActor in
-            self.stopRingback()   // ensure ringback is gone before RTP starts
+            self.stopRingback()
+            // Give CallKit full ownership of the audio session during the call.
+            self.stopSilentAudio()
             self.sipHandler.handleAudioActivation()
         }
     }
 
-    /// CallKit deactivated the audio session (e.g. interrupted by a native phone call).
+    /// CallKit deactivated the audio session — call ended or interrupted.
     nonisolated func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
         Task { @MainActor in
             self.sipHandler.handleAudioDeactivation()
+            // If the app is still in the background after the call ends,
+            // restart the silent audio so the process doesn't get suspended.
+            if UIApplication.shared.applicationState != .active {
+                self.startSilentAudio()
+            }
         }
     }
 }
