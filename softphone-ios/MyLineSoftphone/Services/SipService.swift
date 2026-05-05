@@ -43,6 +43,8 @@ final class SipService: NSObject, ObservableObject {
 
     // Ringback tone played locally on outgoing calls before the remote party answers.
     private var ringbackPlayer: AVAudioPlayer?
+    // Busy tone played locally when the remote party is busy.
+    private var busyPlayer: AVAudioPlayer?
 
     override init() {
         let config = CXProviderConfiguration()
@@ -148,15 +150,28 @@ final class SipService: NSObject, ObservableObject {
             reportIncomingCall(number: number, name: name)
         case .confirmed:
             stopRingback()
+            stopBusy()
             if let uuid = activeCallUUID, isOutgoingCall {
                 provider.reportOutgoingCall(with: uuid, connectedAt: Date())
             }
-        case .disconnected, .rejected, .busy:
+        case .busy:
             stopRingback()
+            startBusy()
             if let uuid = activeCallUUID {
                 provider.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
                 activeCallUUID = nil
             }
+        case .disconnected, .rejected:
+            stopRingback()
+            stopBusy()
+            if let uuid = activeCallUUID {
+                provider.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
+                activeCallUUID = nil
+            }
+        case .idle:
+            // SipHandler reset after busy/rejected — stop any lingering tones.
+            stopBusy()
+            stopRingback()
         default:
             break
         }
@@ -199,6 +214,66 @@ final class SipService: NSObject, ObservableObject {
         for i in 0..<onFrames {
             let t = Double(i) / Double(rate)
             let v = 0.28 * (sin(2 * .pi * 440 * t) + sin(2 * .pi * 480 * t))
+            let clamped = max(-32767, min(32767, Int(v * 32767)))
+            samples[i] = Int16(clamped)
+        }
+
+        func le32(_ v: UInt32) -> [UInt8] {
+            [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF), UInt8((v >> 16) & 0xFF), UInt8((v >> 24) & 0xFF)]
+        }
+        func le16(_ v: UInt16) -> [UInt8] { [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF)] }
+
+        let dataBytes = UInt32(total * 2)
+        var wav = Data()
+        wav += "RIFF".utf8;  wav += le32(36 + dataBytes)
+        wav += "WAVE".utf8;  wav += "fmt ".utf8; wav += le32(16)
+        wav += le16(1)                              // PCM
+        wav += le16(1)                              // mono
+        wav += le32(UInt32(rate))                   // sample rate
+        wav += le32(UInt32(rate * 2))               // byte rate
+        wav += le16(2)                              // block align
+        wav += le16(16)                             // bits per sample
+        wav += "data".utf8; wav += le32(dataBytes)
+        wav += samples.withUnsafeBytes { Data($0) }
+        return wav
+    }
+
+    // MARK: - Busy tone
+
+    /// Plays the standard US busy signal (480 + 620 Hz, 0.5 s on / 0.5 s off).
+    /// Stops automatically when the call resets to .idle.
+    private func startBusy() {
+        guard busyPlayer == nil else { return }
+        let wav = buildBusyWav()
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: .mixWithOthers)
+            try AVAudioSession.sharedInstance().setActive(true)
+            let player = try AVAudioPlayer(data: wav, fileTypeHint: AVFileType.wav.rawValue)
+            player.numberOfLoops = -1   // loop until SipHandler resets to .idle
+            player.volume = 0.7
+            player.play()
+            busyPlayer = player
+        } catch {
+            Self.log.warning("Busy tone start failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func stopBusy() {
+        busyPlayer?.stop()
+        busyPlayer = nil
+    }
+
+    /// Builds a 1-second US busy-signal cycle (480 + 620 Hz, 0.5 s on / 0.5 s off).
+    private func buildBusyWav() -> Data {
+        let rate     = 44100
+        let onFrames = rate / 2    // 0.5 s ring
+        let offFrames = rate / 2   // 0.5 s silence
+        let total    = onFrames + offFrames
+
+        var samples = [Int16](repeating: 0, count: total)
+        for i in 0..<onFrames {
+            let t = Double(i) / Double(rate)
+            let v = 0.28 * (sin(2 * .pi * 480 * t) + sin(2 * .pi * 620 * t))
             let clamped = max(-32767, min(32767, Int(v * 32767)))
             samples[i] = Int16(clamped)
         }

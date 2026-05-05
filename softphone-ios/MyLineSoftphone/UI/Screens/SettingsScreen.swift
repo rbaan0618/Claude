@@ -16,9 +16,19 @@ struct SettingsScreen: View {
                     SecureField("Password", text: $config.password)
                 }
                 Section("Server") {
-                    TextField("Server", text: $config.server)
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
+                    // Show the .myline.tel suffix inline when the user hasn't typed a full domain.
+                    // SipConfig.domain appends .myline.tel automatically when there is no dot,
+                    // matching the Android behaviour.
+                    HStack(spacing: 2) {
+                        TextField("yourserver", text: $config.server)
+                            .autocapitalization(.none)
+                            .disableAutocorrection(true)
+                            .keyboardType(.URL)
+                        if !config.server.isEmpty && !config.server.contains(".") {
+                            Text(".myline.tel")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                     Stepper("Port: \(config.port)", value: $config.port, in: 1...65535)
                     Stepper("Local port: \(config.localPort)", value: $config.localPort, in: 1024...65535)
                     Picker("Transport", selection: $config.transport) {

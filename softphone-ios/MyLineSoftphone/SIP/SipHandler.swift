@@ -909,7 +909,8 @@ final class SipHandler: ObservableObject {
         case 486, 600:
             sendAck(responseMessage: message, isNon2xx: true)
             setCallState(.busy, number: remoteNumber, name: remoteName)
-            ioQueue.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.resetCallState() }
+            // 4.5 s gives the busy tone enough time to play (~4 cycles of 0.5 s on / 0.5 s off).
+            ioQueue.asyncAfter(deadline: .now() + 4.5) { [weak self] in self?.resetCallState() }
         case 400...699:
             Self.log.warning("Call rejected: \(statusCode)")
             sendAck(responseMessage: message, isNon2xx: true)
