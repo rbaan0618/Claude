@@ -24,7 +24,7 @@ struct ContentView: View {
         .fullScreenCover(isPresented: $showInCall) {
             InCallScreen().environmentObject(service)
         }
-        .onChange(of: service.sipHandler.callState) { state in
+        .onChange(of: service.callState) { state in
             if state != .idle {
                 // Any active call state → show the in-call screen
                 showInCall = true

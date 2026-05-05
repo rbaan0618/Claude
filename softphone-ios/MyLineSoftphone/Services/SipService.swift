@@ -26,6 +26,9 @@ final class SipService: NSObject, ObservableObject {
 
     let sipHandler = SipHandler()
 
+    // Republished so ContentView (which observes SipService) re-renders on call state changes.
+    @Published private(set) var callState: CallState = .idle
+
     // CallKit
     private let provider: CXProvider
     private let callController = CXCallController()
@@ -120,6 +123,9 @@ final class SipService: NSObject, ObservableObject {
     // MARK: - SipHandler → CallKit bridge
 
     private func handleCallStateChanged(state: CallState, number: String, name: String) {
+        // Re-publish so ContentView observes the change and updates showInCall.
+        callState = state
+
         switch state {
         case .incoming:
             reportIncomingCall(number: number, name: name)
