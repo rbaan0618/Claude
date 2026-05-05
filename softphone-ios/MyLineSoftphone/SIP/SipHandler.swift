@@ -467,13 +467,16 @@ final class SipHandler: ObservableObject {
     func sendMessage(to recipient: String, text: String, messageType: String = "sms") {
         ioQueue.async { [weak self] in
             guard let self, self.registrationState == .registered else { return }
-            // Route by channel: WhatsApp numbers keep the '+' prefix so the server
-            // recognises them as WhatsApp. SMS numbers must NOT have a '+' prefix.
+            // FreeSWITCH strips the '+' prefix, so routing is determined by digit count:
+            //   WhatsApp → 11 digits with leading country code 1 (e.g. 13059684280)
+            //   SMS      → 10 digits, no country code        (e.g.  3059684280)
+            // Mirrors Android MainActivity.kt sendMessage routing logic.
+            let digits = recipient.replacingOccurrences(of: "[^0-9]", with: "", options: .regularExpression)
             let routedRecipient: String
             if messageType == "whatsapp" {
-                routedRecipient = recipient.hasPrefix("+") ? recipient : "+\(recipient)"
+                routedRecipient = digits.count == 10 ? "1\(digits)" : digits
             } else {
-                routedRecipient = recipient.hasPrefix("+") ? String(recipient.dropFirst()) : recipient
+                routedRecipient = (digits.count == 11 && digits.hasPrefix("1")) ? String(digits.dropFirst()) : digits
             }
             let msgCallId = self.generateCallId()
             let fromTag = self.generateTag()

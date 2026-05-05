@@ -4,6 +4,7 @@ import SwiftUI
 /// When a call is active, the in-call screen is presented as a full-screen cover.
 struct ContentView: View {
     @EnvironmentObject var service: SipService
+    @State private var showInCall = false
 
     var body: some View {
         TabView {
@@ -20,15 +21,17 @@ struct ContentView: View {
             SettingsScreen()
                 .tabItem { Label("Settings", systemImage: "gearshape") }
         }
-        .fullScreenCover(isPresented: .constant(isInCall)) {
+        .fullScreenCover(isPresented: $showInCall) {
             InCallScreen().environmentObject(service)
         }
-    }
-
-    private var isInCall: Bool {
-        // Only hide the in-call screen when fully idle.
-        // Keeping it visible through .disconnected/.rejected/.busy lets the user
-        // see the final call state before resetCallState() fires ~1 second later.
-        service.sipHandler.callState != .idle
+        .onChange(of: service.sipHandler.callState) { state in
+            if state != .idle {
+                // Any active call state → show the in-call screen
+                showInCall = true
+            } else {
+                // Only dismiss when fully idle (resetCallState fired)
+                showInCall = false
+            }
+        }
     }
 }
