@@ -4,6 +4,7 @@ import SwiftUI
 @main
 struct MyLineSoftphoneApp: App {
     @StateObject private var service = SipService.shared
+    @Environment(\.scenePhase) private var scenePhase
 
     init() {
         _ = AppDatabase.shared
@@ -18,6 +19,18 @@ struct MyLineSoftphoneApp: App {
                     let config = SettingsRepository.shared.load()
                     if config.isValid { service.start(with: config) }
                 }
+        }
+        .onChange(of: scenePhase) { phase in
+            switch phase {
+            case .background:
+                // Request extra execution time so keepalives continue briefly.
+                service.handleAppBackground()
+            case .active:
+                // Re-register if the SIP stack died while we were suspended.
+                service.handleAppForeground()
+            default:
+                break
+            }
         }
     }
 }

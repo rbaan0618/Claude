@@ -4,6 +4,7 @@ import PushKit
 import AVFoundation
 import Combine
 import UserNotifications
+import UIKit
 import os.log
 
 /// Top-level service that owns the `SipHandler` singleton and bridges iOS system
@@ -45,6 +46,10 @@ final class SipService: NSObject, ObservableObject {
     private var ringbackPlayer: AVAudioPlayer?
     // Busy tone played locally when the remote party is busy.
     private var busyPlayer: AVAudioPlayer?
+
+    // Background task identifier — keeps the process alive ~30 s after backgrounding
+    // so the keepalive OPTIONS can still reach the server before iOS suspends us.
+    private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
 
     override init() {
         let config = CXProviderConfiguration()
@@ -113,6 +118,40 @@ final class SipService: NSObject, ObservableObject {
 
     func stop() {
         sipHandler.stop()
+    }
+
+    // MARK: - App lifecycle (background / foreground)
+
+    /// Call when `scenePhase` becomes `.background`.
+    /// Requests ~30 s of extra execution time so keepalive OPTIONS packets
+    /// can still be sent before iOS suspends the process.
+    func handleAppBackground() {
+        guard backgroundTaskID == .invalid else { return }
+        backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "SIPKeepalive") { [weak self] in
+            // Expiry handler — iOS is about to force-suspend; release the task.
+            Self.log.warning("Background task expired — SIP keepalive will stop")
+            self?.endBackgroundTask()
+        }
+        Self.log.info("Background task started (id=\(self.backgroundTaskID.rawValue))")
+    }
+
+    /// Call when `scenePhase` becomes `.active`.
+    /// Ends the background task and re-registers if the SIP stack died while suspended.
+    func handleAppForeground() {
+        endBackgroundTask()
+
+        // If registration dropped while we were suspended, restart the stack.
+        guard registrationState != .registered && registrationState != .registering else { return }
+        let config = SettingsRepository.shared.load()
+        guard config.isValid else { return }
+        Self.log.info("App foregrounded with lost registration — restarting SIP stack")
+        sipHandler.restartForNetworkChange()
+    }
+
+    private func endBackgroundTask() {
+        guard backgroundTaskID != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundTaskID)
+        backgroundTaskID = .invalid
     }
 
     // MARK: - Outbound calls via CallKit
