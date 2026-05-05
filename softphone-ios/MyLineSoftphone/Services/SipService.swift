@@ -41,6 +41,9 @@ final class SipService: NSObject, ObservableObject {
 
     private var cancellables = Set<AnyCancellable>()
 
+    // Ringback tone played locally on outgoing calls before the remote party answers.
+    private var ringbackPlayer: AVAudioPlayer?
+
     override init() {
         let config = CXProviderConfiguration()
         config.supportsVideo = false
@@ -138,13 +141,18 @@ final class SipService: NSObject, ObservableObject {
         callState = state
 
         switch state {
+        case .calling, .ringing:
+            // Play a local ringback tone so the caller hears ringing while waiting.
+            if isOutgoingCall { startRingback() }
         case .incoming:
             reportIncomingCall(number: number, name: name)
         case .confirmed:
+            stopRingback()
             if let uuid = activeCallUUID, isOutgoingCall {
                 provider.reportOutgoingCall(with: uuid, connectedAt: Date())
             }
         case .disconnected, .rejected, .busy:
+            stopRingback()
             if let uuid = activeCallUUID {
                 provider.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
                 activeCallUUID = nil
@@ -152,6 +160,67 @@ final class SipService: NSObject, ObservableObject {
         default:
             break
         }
+    }
+
+    // MARK: - Ringback tone
+
+    /// Starts the local NANP ringback tone (440 + 480 Hz, 2 s on / 4 s off).
+    /// Harmless no-op if already playing.
+    private func startRingback() {
+        guard ringbackPlayer == nil else { return }
+        let wav = buildRingbackWav()
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: .mixWithOthers)
+            try AVAudioSession.sharedInstance().setActive(true)
+            let player = try AVAudioPlayer(data: wav, fileTypeHint: AVFileType.wav.rawValue)
+            player.numberOfLoops = -1   // loop until stopped
+            player.volume = 0.7
+            player.play()
+            ringbackPlayer = player
+        } catch {
+            Self.log.warning("Ringback start failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func stopRingback() {
+        ringbackPlayer?.stop()
+        ringbackPlayer = nil
+    }
+
+    /// Builds a one-cycle (6 s) NANP ringback as a raw PCM WAV:
+    /// 440 Hz + 480 Hz mixed, 2 s audible / 4 s silence.
+    private func buildRingbackWav() -> Data {
+        let rate = 44100
+        let onFrames  = rate * 2   // 2 s ring
+        let offFrames = rate * 4   // 4 s silence
+        let total     = onFrames + offFrames
+
+        var samples = [Int16](repeating: 0, count: total)
+        for i in 0..<onFrames {
+            let t = Double(i) / Double(rate)
+            let v = 0.28 * (sin(2 * .pi * 440 * t) + sin(2 * .pi * 480 * t))
+            let clamped = max(-32767, min(32767, Int(v * 32767)))
+            samples[i] = Int16(clamped)
+        }
+
+        func le32(_ v: UInt32) -> [UInt8] {
+            [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF), UInt8((v >> 16) & 0xFF), UInt8((v >> 24) & 0xFF)]
+        }
+        func le16(_ v: UInt16) -> [UInt8] { [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF)] }
+
+        let dataBytes = UInt32(total * 2)
+        var wav = Data()
+        wav += "RIFF".utf8;  wav += le32(36 + dataBytes)
+        wav += "WAVE".utf8;  wav += "fmt ".utf8; wav += le32(16)
+        wav += le16(1)                              // PCM
+        wav += le16(1)                              // mono
+        wav += le32(UInt32(rate))                   // sample rate
+        wav += le32(UInt32(rate * 2))               // byte rate
+        wav += le16(2)                              // block align
+        wav += le16(16)                             // bits per sample
+        wav += "data".utf8; wav += le32(dataBytes)
+        wav += samples.withUnsafeBytes { Data($0) }
+        return wav
     }
 
     private func reportIncomingCall(number: String, name: String) {
@@ -225,6 +294,7 @@ extension SipService: CXProviderDelegate {
     /// CallKit has activated the shared audio session — safe to start RTP audio now.
     nonisolated func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
         Task { @MainActor in
+            self.stopRingback()   // ensure ringback is gone before RTP starts
             self.sipHandler.handleAudioActivation()
         }
     }
