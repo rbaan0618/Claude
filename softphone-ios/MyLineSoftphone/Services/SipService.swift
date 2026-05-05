@@ -204,6 +204,20 @@ extension SipService: CXProviderDelegate {
             action.fulfill()
         }
     }
+
+    /// CallKit has activated the shared audio session — safe to start RTP audio now.
+    nonisolated func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
+        Task { @MainActor in
+            self.sipHandler.handleAudioActivation()
+        }
+    }
+
+    /// CallKit deactivated the audio session (e.g. interrupted by a native phone call).
+    nonisolated func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
+        Task { @MainActor in
+            self.sipHandler.handleAudioDeactivation()
+        }
+    }
 }
 
 // MARK: - PushKit (VoIP push)

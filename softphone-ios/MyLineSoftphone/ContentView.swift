@@ -26,9 +26,9 @@ struct ContentView: View {
     }
 
     private var isInCall: Bool {
-        switch service.sipHandler.callState {
-        case .idle, .disconnected, .rejected, .busy: return false
-        default: return true
-        }
+        // Only hide the in-call screen when fully idle.
+        // Keeping it visible through .disconnected/.rejected/.busy lets the user
+        // see the final call state before resetCallState() fires ~1 second later.
+        service.sipHandler.callState != .idle
     }
 }

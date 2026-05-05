@@ -445,6 +445,25 @@ final class SipHandler: ObservableObject {
         ioQueue.async { [weak self] in self?.rtpSession?.sendDtmf(digit) }
     }
 
+    /// Called by SipService when CallKit activates the audio session.
+    /// If RTP hasn't started yet (audio session was not ready earlier), start it now.
+    func handleAudioActivation() {
+        ioQueue.async { [weak self] in
+            guard let self else { return }
+            if (self.callState == .confirmed || self.callState == .hold) && self.rtpSession == nil {
+                Self.log.info("Audio activated by CallKit — starting RTP")
+                self.startRtp()
+            }
+        }
+    }
+
+    /// Called by SipService when CallKit deactivates the audio session.
+    func handleAudioDeactivation() {
+        ioQueue.async { [weak self] in
+            self?.rtpSession?.stop()
+        }
+    }
+
     func sendMessage(to recipient: String, text: String, messageType: String = "sms") {
         ioQueue.async { [weak self] in
             guard let self, self.registrationState == .registered else { return }
