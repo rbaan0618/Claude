@@ -158,8 +158,8 @@ final class SipService: NSObject, ObservableObject {
         engine.attach(node)
 
         // 8 kHz mono — same rate as our codec, tiny buffer footprint.
-        guard let format = AVAudioFormat(standardFormatWithSampleChannelCount: 1,
-                                         sampleRate: 8000) else { return }
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: 8000,
+                                         channels: 1) else { return }
         engine.connect(node, to: engine.mainMixerNode, format: format)
 
         // One second of silence, looped forever.
