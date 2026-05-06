@@ -446,6 +446,14 @@ extension SipService: CXProviderDelegate {
         Task { @MainActor in
             self.sipHandler.answerCall()
             action.fulfill()
+            // When answered from the lock screen iOS does not automatically bring the
+            // app to foreground — request scene activation so InCallScreen is visible.
+            if #available(iOS 13, *) {
+                UIApplication.shared.connectedScenes
+                    .compactMap { $0 as? UIWindowScene }
+                    .first.map { UIApplication.shared.requestSceneSessionActivation(
+                        $0.session, userActivity: nil, options: nil, errorHandler: nil) }
+            }
         }
     }
 
@@ -479,25 +487,13 @@ extension SipService: CXProviderDelegate {
     }
 
     /// CallKit has activated the shared audio session — safe to start RTP audio now.
+    /// RtpSession.configureAudioSession() does the full setup (setCategory + setActive)
+    /// inside handleAudioActivation — splitting it across two places/threads caused
+    /// partial configurations that left inputNode.inputFormat returning zero sampleRate.
     nonisolated func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
         Task { @MainActor in
             self.stopRingback()
             self.stopSilentAudio()
-
-            // Configure audio session HERE on the main thread — BEFORE dispatching to
-            // ioQueue for startAudioEngine().  This guarantees the hardware has fully
-            // switched to .playAndRecord before inputNode.inputFormat(forBus:0) is
-            // queried, preventing a silent zero-sampleRate failure.
-            do {
-                try audioSession.setCategory(.playAndRecord,
-                                             mode: .voiceChat,
-                                             options: [.allowBluetoothHFP, .allowBluetoothA2DP])
-                try audioSession.setPreferredSampleRate(8000)
-                try audioSession.setPreferredIOBufferDuration(0.02)
-            } catch {
-                Self.log.warning("Audio session didActivate config failed: \(error.localizedDescription, privacy: .public)")
-            }
-
             self.sipHandler.handleAudioActivation()
         }
     }
