@@ -138,6 +138,10 @@ final class SipService: NSObject, ObservableObject {
     /// stack somehow dropped while we were in the background.
     func handleAppForeground() {
         stopSilentAudio()
+        // Safe to release the session here — no call in progress, not inside any
+        // CallKit callback.  This frees the audio hardware for other apps.
+        try? AVAudioSession.sharedInstance().setActive(false,
+                                                       options: .notifyOthersOnDeactivation)
 
         guard registrationState != .registered && registrationState != .registering else { return }
         let config = SettingsRepository.shared.load()
@@ -185,14 +189,16 @@ final class SipService: NSObject, ObservableObject {
     }
 
     private func stopSilentAudio() {
+        guard silentEngine != nil else { return }
         silentNode?.stop()
         silentEngine?.stop()
         silentEngine = nil
         silentNode   = nil
-        // Release our hold on the audio session so CallKit can own it cleanly
-        // for the RTP voice path (.playAndRecord / .voiceChat).
-        try? AVAudioSession.sharedInstance().setActive(false,
-                                                       options: .notifyOthersOnDeactivation)
+        // NOTE: do NOT call setActive(false) here.  Apple's CallKit rule:
+        // "Never deactivate the audio session in response to being activated."
+        // This method is called from provider(_:didActivate:) — deactivating there
+        // kills the session CallKit just handed us and breaks RTP audio.
+        // Session cleanup happens in handleAppForeground() (outside any call).
     }
 
     // MARK: - Outbound calls via CallKit
@@ -280,9 +286,9 @@ final class SipService: NSObject, ObservableObject {
     private func stopRingback() {
         ringbackPlayer?.stop()
         ringbackPlayer = nil
-        // Deactivate so the session is free when RTP reconfigures it for voice.
-        try? AVAudioSession.sharedInstance().setActive(false,
-                                                       options: .notifyOthersOnDeactivation)
+        // Do NOT call setActive(false) — same CallKit rule as stopSilentAudio().
+        // RtpSession.configureAudioSession() will switch the category to
+        // .playAndRecord / .voiceChat on the already-active session.
     }
 
     /// Builds a one-cycle (6 s) NANP ringback as a raw PCM WAV:
