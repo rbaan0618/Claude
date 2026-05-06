@@ -47,12 +47,13 @@ final class SipService: NSObject, ObservableObject {
     // Busy tone played locally when the remote party is busy.
     private var busyPlayer: AVAudioPlayer?
 
-    // Silent audio engine — keeps the process alive in the background exactly
+    // Silent audio player — keeps the process alive in the background exactly
     // like Android's foreground VoIP service.  UIBackgroundModes:audio tells
-    // iOS "don't suspend this app"; a zero-filled looping buffer costs no CPU
-    // and produces no audible sound.
-    private var silentEngine: AVAudioEngine?
-    private var silentNode:   AVAudioPlayerNode?
+    // iOS "don't suspend this app"; a zero-filled looping WAV costs no CPU and
+    // produces no audible sound.  AVAudioPlayer is far simpler than AVAudioEngine
+    // and avoids engine-vs-engine conflicts when the call's RtpSession.engine
+    // takes over the audio session.
+    private var silentPlayer: AVAudioPlayer?
 
     override init() {
         let config = CXProviderConfiguration(localizedName: "MyLine")
@@ -155,16 +156,8 @@ final class SipService: NSObject, ObservableObject {
     /// stack somehow dropped while we were in the background.
     func handleAppForeground() {
         stopSilentAudio()
-
-        // Release the audio session ONLY when there is no active call.
-        // When the user answers from the lock screen the sequence is:
-        //   provider(_:didActivate:) → RTP starts  →  phone unlocks  →  this runs.
-        // Calling setActive(false) here while a call is live would kill CallKit's
-        // audio session and silence the call — the exact lock-screen audio bug.
-        if callState == .idle {
-            try? AVAudioSession.sharedInstance().setActive(false,
-                                                           options: .notifyOthersOnDeactivation)
-        }
+        // Do not touch AVAudioSession here.  iOS will manage it; deactivating
+        // it has caused live calls to lose audio (when answering from lock screen).
 
         guard registrationState != .registered && registrationState != .registering else { return }
         let config = SettingsRepository.shared.load()
@@ -175,36 +168,21 @@ final class SipService: NSObject, ObservableObject {
 
     // MARK: - Silent background audio (VoIP keepalive)
 
-    /// Plays a zero-filled audio loop so iOS keeps the process alive
+    /// Plays a silent looping WAV so iOS keeps the process alive
     /// indefinitely under UIBackgroundModes:audio.  Costs ~0 CPU / battery.
     private func startSilentAudio() {
-        guard silentEngine == nil else { return }
-
-        let engine = AVAudioEngine()
-        let node   = AVAudioPlayerNode()
-        engine.attach(node)
-
-        // 8 kHz mono — same rate as our codec, tiny buffer footprint.
-        guard let format = AVAudioFormat(standardFormatWithSampleRate: 8000,
-                                         channels: 1) else { return }
-        engine.connect(node, to: engine.mainMixerNode, format: format)
-
-        // One second of silence, looped forever.
-        let frameCount: AVAudioFrameCount = 8000
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format,
-                                            frameCapacity: frameCount) else { return }
-        buffer.frameLength = frameCount
-        // floatChannelData is zero-initialised — no fill needed.
-
+        guard silentPlayer == nil else { return }
+        let wav = buildSilentWav()
         do {
-            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default,
-                                                            options: .mixWithOthers)
+            try AVAudioSession.sharedInstance().setCategory(.playback,
+                                                             mode: .default,
+                                                             options: .mixWithOthers)
             try AVAudioSession.sharedInstance().setActive(true)
-            try engine.start()
-            node.scheduleBuffer(buffer, at: nil, options: .loops)
-            node.play()
-            silentEngine = engine
-            silentNode   = node
+            let player = try AVAudioPlayer(data: wav, fileTypeHint: AVFileType.wav.rawValue)
+            player.numberOfLoops = -1   // loop forever
+            player.volume = 0.0         // truly silent
+            player.play()
+            silentPlayer = player
             Self.log.info("Background silent audio started — SIP stack will stay alive")
         } catch {
             Self.log.warning("Silent audio failed: \(error.localizedDescription, privacy: .public)")
@@ -212,16 +190,34 @@ final class SipService: NSObject, ObservableObject {
     }
 
     private func stopSilentAudio() {
-        guard silentEngine != nil else { return }
-        silentNode?.stop()
-        silentEngine?.stop()
-        silentEngine = nil
-        silentNode   = nil
+        guard silentPlayer != nil else { return }
+        silentPlayer?.stop()
+        silentPlayer = nil
         // NOTE: do NOT call setActive(false) here.  Apple's CallKit rule:
         // "Never deactivate the audio session in response to being activated."
         // This method is called from provider(_:didActivate:) — deactivating there
         // kills the session CallKit just handed us and breaks RTP audio.
-        // Session cleanup happens in handleAppForeground() (outside any call).
+    }
+
+    /// Builds a 1-second mono 8 kHz silent PCM WAV.
+    private func buildSilentWav() -> Data {
+        let rate = 8000
+        let total = rate
+        let samples = [Int16](repeating: 0, count: total)
+        func le32(_ v: UInt32) -> [UInt8] {
+            [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF), UInt8((v >> 16) & 0xFF), UInt8((v >> 24) & 0xFF)]
+        }
+        func le16(_ v: UInt16) -> [UInt8] { [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF)] }
+        let dataBytes = UInt32(total * 2)
+        var wav = Data()
+        wav += "RIFF".utf8;  wav += le32(36 + dataBytes)
+        wav += "WAVE".utf8;  wav += "fmt ".utf8; wav += le32(16)
+        wav += le16(1); wav += le16(1)
+        wav += le32(UInt32(rate)); wav += le32(UInt32(rate * 2))
+        wav += le16(2); wav += le16(16)
+        wav += "data".utf8; wav += le32(dataBytes)
+        wav += samples.withUnsafeBytes { Data($0) }
+        return wav
     }
 
     // MARK: - Outbound calls via CallKit

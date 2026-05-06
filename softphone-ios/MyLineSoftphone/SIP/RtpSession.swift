@@ -156,7 +156,7 @@ final class RtpSession {
         do {
             try session.setCategory(.playAndRecord,
                                     mode: .voiceChat,
-                                    options: [.allowBluetoothHFP, .allowBluetoothA2DP])
+                                    options: [.allowBluetoothHFP])
             try session.setPreferredSampleRate(Self.sampleRate)
             try session.setPreferredIOBufferDuration(0.02)
             try session.setActive(true)
