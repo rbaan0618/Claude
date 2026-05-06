@@ -115,6 +115,11 @@ final class SipHandler: ObservableObject {
     private var consultRemoteRtpPort: Int = 0
     private var consultNegotiatedCodec: Int = 0
 
+    // MARK: - CallKit audio gate
+    // Set true when CallKit fires provider(_:didActivate:). RTP must not start
+    // before this fires — the audio session isn't fully owned by us until then.
+    private var callKitAudioActive: Bool = false
+
     // MARK: - BLF subscription tracking
 
     private struct BlfSubscription {
@@ -301,8 +306,10 @@ final class SipHandler: ObservableObject {
                 sdp
 
             self.sendSip(response)
-            self.startRtp()
             self.setCallState(.confirmed, number: self.remoteNumber, name: self.remoteName)
+            // Only start RTP if CallKit has already activated the audio session.
+            // If not yet, handleAudioActivation() will start it when the session is ready.
+            if self.callKitAudioActive { self.startRtp() }
         }
     }
 
@@ -466,21 +473,34 @@ final class SipHandler: ObservableObject {
     }
 
     /// Called by SipService when CallKit activates the audio session.
-    /// If RTP hasn't started yet (audio session was not ready earlier), start it now.
+    /// Sets the audio gate and starts (or restarts) RTP if the call is confirmed.
+    /// This is the ONLY safe place to start RTP — the audio session is fully
+    /// owned by CallKit only after this callback fires.
     func handleAudioActivation() {
         ioQueue.async { [weak self] in
             guard let self else { return }
-            if (self.callState == .confirmed || self.callState == .hold) && self.rtpSession == nil {
-                Self.log.info("Audio activated by CallKit — starting RTP")
-                self.startRtp()
+            self.callKitAudioActive = true
+            guard self.callState == .confirmed || self.callState == .hold else {
+                // Call not confirmed yet; startRtp() will be called once 200 OK/answer arrives.
+                Self.log.info("Audio activated by CallKit — call not confirmed yet, will start RTP on answer")
+                return
             }
+            // Always stop any stale session and restart clean — handles both the
+            // case where RTP was never started and where it started too early.
+            Self.log.info("Audio activated by CallKit — starting RTP")
+            self.rtpSession?.stop()
+            self.rtpSession = nil
+            self.startRtp()
         }
     }
 
     /// Called by SipService when CallKit deactivates the audio session.
     func handleAudioDeactivation() {
         ioQueue.async { [weak self] in
-            self?.rtpSession?.stop()
+            guard let self else { return }
+            self.callKitAudioActive = false
+            self.rtpSession?.stop()
+            self.rtpSession = nil
         }
     }
 
@@ -908,8 +928,10 @@ final class SipHandler: ObservableObject {
             sendAck(responseMessage: message, isNon2xx: false)
             inviteAuthAttempted = false
             if callState == .calling || callState == .ringing {
-                startRtp()
                 setCallState(.confirmed, number: remoteNumber, name: remoteName)
+                // Only start RTP if CallKit audio is already active; otherwise
+                // handleAudioActivation() will start it when the session is ready.
+                if callKitAudioActive { startRtp() }
             }
         case 401, 407:
             if inviteAuthAttempted {
@@ -1868,6 +1890,7 @@ final class SipHandler: ObservableObject {
         remoteRtpHost = ""
         remoteRtpPort = 0
         negotiatedCodec = 0
+        callKitAudioActive = false
         rtpSession?.stop(); rtpSession = nil
         if rtpSocketFD >= 0 { Darwin.close(rtpSocketFD); rtpSocketFD = -1 }
         cleanupConsultation()

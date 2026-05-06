@@ -189,6 +189,10 @@ final class SipService: NSObject, ObservableObject {
         silentEngine?.stop()
         silentEngine = nil
         silentNode   = nil
+        // Release our hold on the audio session so CallKit can own it cleanly
+        // for the RTP voice path (.playAndRecord / .voiceChat).
+        try? AVAudioSession.sharedInstance().setActive(false,
+                                                       options: .notifyOthersOnDeactivation)
     }
 
     // MARK: - Outbound calls via CallKit
@@ -276,6 +280,9 @@ final class SipService: NSObject, ObservableObject {
     private func stopRingback() {
         ringbackPlayer?.stop()
         ringbackPlayer = nil
+        // Deactivate so the session is free when RTP reconfigures it for voice.
+        try? AVAudioSession.sharedInstance().setActive(false,
+                                                       options: .notifyOthersOnDeactivation)
     }
 
     /// Builds a one-cycle (6 s) NANP ringback as a raw PCM WAV:
