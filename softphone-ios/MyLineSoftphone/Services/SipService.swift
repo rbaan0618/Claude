@@ -123,6 +123,19 @@ final class SipService: NSObject, ObservableObject {
         sipHandler.stop()
     }
 
+    /// Toggle earpiece ↔ speaker during an active call.
+    /// Uses AVAudioSession.overrideOutputAudioPort which works while CallKit
+    /// owns the session (.voiceChat defaults to earpiece; speaker overrides it).
+    func setSpeaker(_ on: Bool) {
+        do {
+            try AVAudioSession.sharedInstance()
+                .overrideOutputAudioPort(on ? .speaker : .none)
+            Self.log.info("Speaker \(on ? "ON" : "OFF (earpiece)", privacy: .public)")
+        } catch {
+            Self.log.warning("Speaker override failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
     // MARK: - App lifecycle (background / foreground)
 
     /// Call when `scenePhase` becomes `.background`.

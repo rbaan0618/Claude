@@ -6,6 +6,7 @@ struct InCallScreen: View {
     @EnvironmentObject var service: SipService
     @State private var muted = false
     @State private var held = false
+    @State private var speakerOn = false
     @State private var showTransfer = false
 
     var body: some View {
@@ -19,17 +20,27 @@ struct InCallScreen: View {
 
             Spacer()
 
+            // Row 1: Mute · Speaker · Hold
             HStack(spacing: 32) {
                 CallActionButton(icon: muted ? "mic.slash.fill" : "mic.fill",
                                  label: "Mute", active: muted) {
                     muted.toggle()
                     service.sipHandler.setMuted(muted)
                 }
+                CallActionButton(icon: speakerOn ? "speaker.wave.3.fill" : "speaker.fill",
+                                 label: "Speaker", active: speakerOn) {
+                    speakerOn.toggle()
+                    service.setSpeaker(speakerOn)
+                }
                 CallActionButton(icon: "pause.fill",
                                  label: "Hold", active: held) {
                     held.toggle()
                     service.sipHandler.setHold(held)
                 }
+            }
+
+            // Row 2: Transfer
+            HStack(spacing: 32) {
                 CallActionButton(icon: "arrow.uturn.forward",
                                  label: "Transfer", active: false) {
                     showTransfer = true
