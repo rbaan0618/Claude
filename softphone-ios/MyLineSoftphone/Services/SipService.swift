@@ -143,7 +143,11 @@ final class SipService: NSObject, ObservableObject {
     /// keeping the UDP socket open and the keepalive timer running — the same
     /// role Android's foreground VoIP service plays.
     func handleAppBackground() {
-        startSilentAudio()
+        // Don't start silent audio while a call is active — the RTP engine already
+        // owns the audio session and keeps the process alive via UIBackgroundModes:audio.
+        if callState == .idle {
+            startSilentAudio()
+        }
     }
 
     /// Call when `scenePhase` becomes `.active`.
@@ -151,10 +155,16 @@ final class SipService: NSObject, ObservableObject {
     /// stack somehow dropped while we were in the background.
     func handleAppForeground() {
         stopSilentAudio()
-        // Safe to release the session here — no call in progress, not inside any
-        // CallKit callback.  This frees the audio hardware for other apps.
-        try? AVAudioSession.sharedInstance().setActive(false,
-                                                       options: .notifyOthersOnDeactivation)
+
+        // Release the audio session ONLY when there is no active call.
+        // When the user answers from the lock screen the sequence is:
+        //   provider(_:didActivate:) → RTP starts  →  phone unlocks  →  this runs.
+        // Calling setActive(false) here while a call is live would kill CallKit's
+        // audio session and silence the call — the exact lock-screen audio bug.
+        if callState == .idle {
+            try? AVAudioSession.sharedInstance().setActive(false,
+                                                           options: .notifyOthersOnDeactivation)
+        }
 
         guard registrationState != .registered && registrationState != .registering else { return }
         let config = SettingsRepository.shared.load()
