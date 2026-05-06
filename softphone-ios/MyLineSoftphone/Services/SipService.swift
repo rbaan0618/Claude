@@ -47,13 +47,8 @@ final class SipService: NSObject, ObservableObject {
     // Busy tone played locally when the remote party is busy.
     private var busyPlayer: AVAudioPlayer?
 
-    // Silent audio player — keeps the process alive in the background exactly
-    // like Android's foreground VoIP service.  UIBackgroundModes:audio tells
-    // iOS "don't suspend this app"; a zero-filled looping WAV costs no CPU and
-    // produces no audible sound.  AVAudioPlayer is far simpler than AVAudioEngine
-    // and avoids engine-vs-engine conflicts when the call's RtpSession.engine
-    // takes over the audio session.
-    private var silentPlayer: AVAudioPlayer?
+    // Silent-audio keepalive removed — see handleAppBackground() comment.
+    // Background incoming calls require PushKit (server-side bridge needs deploy).
 
     override init() {
         let config = CXProviderConfiguration(localizedName: "MyLine")
@@ -140,84 +135,28 @@ final class SipService: NSObject, ObservableObject {
     // MARK: - App lifecycle (background / foreground)
 
     /// Call when `scenePhase` becomes `.background`.
-    /// Starts a silent audio loop that prevents iOS from suspending the process,
-    /// keeping the UDP socket open and the keepalive timer running — the same
-    /// role Android's foreground VoIP service plays.
+    ///
+    /// Background keepalive via silent audio was REMOVED — having a second
+    /// AVAudioEngine/AVAudioPlayer hold the global AVAudioSession in .playback
+    /// mode left iOS unable to cleanly hand the session to the RTP engine when
+    /// a call started, breaking voice audio entirely.
+    ///
+    /// Background incoming calls require PushKit (already wired in this file)
+    /// + server-side voip_push_bridge.php + freeswitch_push.lua dialplan hook.
+    /// When deployed, FreeSWITCH wakes the suspended app within ~200 ms via APNs,
+    /// the app re-registers, and CallKit answers the INVITE.
     func handleAppBackground() {
-        // Don't start silent audio while a call is active — the RTP engine already
-        // owns the audio session and keeps the process alive via UIBackgroundModes:audio.
-        if callState == .idle {
-            startSilentAudio()
-        }
+        // No-op.  iOS will suspend the app shortly; PushKit will wake it on call.
     }
 
     /// Call when `scenePhase` becomes `.active`.
-    /// Stops the silent audio (no longer needed) and re-registers if the SIP
-    /// stack somehow dropped while we were in the background.
+    /// Re-registers if the SIP stack died while we were suspended.
     func handleAppForeground() {
-        stopSilentAudio()
-        // Do not touch AVAudioSession here.  iOS will manage it; deactivating
-        // it has caused live calls to lose audio (when answering from lock screen).
-
         guard registrationState != .registered && registrationState != .registering else { return }
         let config = SettingsRepository.shared.load()
         guard config.isValid else { return }
         Self.log.info("App foregrounded — restarting SIP stack after background loss")
         sipHandler.restartForNetworkChange()
-    }
-
-    // MARK: - Silent background audio (VoIP keepalive)
-
-    /// Plays a silent looping WAV so iOS keeps the process alive
-    /// indefinitely under UIBackgroundModes:audio.  Costs ~0 CPU / battery.
-    private func startSilentAudio() {
-        guard silentPlayer == nil else { return }
-        let wav = buildSilentWav()
-        do {
-            try AVAudioSession.sharedInstance().setCategory(.playback,
-                                                             mode: .default,
-                                                             options: .mixWithOthers)
-            try AVAudioSession.sharedInstance().setActive(true)
-            let player = try AVAudioPlayer(data: wav, fileTypeHint: AVFileType.wav.rawValue)
-            player.numberOfLoops = -1   // loop forever
-            player.volume = 0.0         // truly silent
-            player.play()
-            silentPlayer = player
-            Self.log.info("Background silent audio started — SIP stack will stay alive")
-        } catch {
-            Self.log.warning("Silent audio failed: \(error.localizedDescription, privacy: .public)")
-        }
-    }
-
-    private func stopSilentAudio() {
-        guard silentPlayer != nil else { return }
-        silentPlayer?.stop()
-        silentPlayer = nil
-        // NOTE: do NOT call setActive(false) here.  Apple's CallKit rule:
-        // "Never deactivate the audio session in response to being activated."
-        // This method is called from provider(_:didActivate:) — deactivating there
-        // kills the session CallKit just handed us and breaks RTP audio.
-    }
-
-    /// Builds a 1-second mono 8 kHz silent PCM WAV.
-    private func buildSilentWav() -> Data {
-        let rate = 8000
-        let total = rate
-        let samples = [Int16](repeating: 0, count: total)
-        func le32(_ v: UInt32) -> [UInt8] {
-            [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF), UInt8((v >> 16) & 0xFF), UInt8((v >> 24) & 0xFF)]
-        }
-        func le16(_ v: UInt16) -> [UInt8] { [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF)] }
-        let dataBytes = UInt32(total * 2)
-        var wav = Data()
-        wav += "RIFF".utf8;  wav += le32(36 + dataBytes)
-        wav += "WAVE".utf8;  wav += "fmt ".utf8; wav += le32(16)
-        wav += le16(1); wav += le16(1)
-        wav += le32(UInt32(rate)); wav += le32(UInt32(rate * 2))
-        wav += le16(2); wav += le16(16)
-        wav += "data".utf8; wav += le32(dataBytes)
-        wav += samples.withUnsafeBytes { Data($0) }
-        return wav
     }
 
     // MARK: - Outbound calls via CallKit
@@ -305,9 +244,9 @@ final class SipService: NSObject, ObservableObject {
     private func stopRingback() {
         ringbackPlayer?.stop()
         ringbackPlayer = nil
-        // Do NOT call setActive(false) — same CallKit rule as stopSilentAudio().
-        // RtpSession.configureAudioSession() will switch the category to
-        // .playAndRecord / .voiceChat on the already-active session.
+        // Do NOT call setActive(false) — Apple rule: never deactivate the session
+        // in response to it being activated. RtpSession.configureAudioSession()
+        // switches the category to .playAndRecord / .voiceChat on the active session.
     }
 
     /// Builds a one-cycle (6 s) NANP ringback as a raw PCM WAV:
@@ -489,7 +428,6 @@ extension SipService: CXProviderDelegate {
     nonisolated func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
         Task { @MainActor in
             self.stopRingback()
-            self.stopSilentAudio()
             self.sipHandler.handleAudioActivation()
         }
     }
@@ -498,11 +436,6 @@ extension SipService: CXProviderDelegate {
     nonisolated func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
         Task { @MainActor in
             self.sipHandler.handleAudioDeactivation()
-            // If the app is still in the background after the call ends,
-            // restart the silent audio so the process doesn't get suspended.
-            if UIApplication.shared.applicationState != .active {
-                self.startSilentAudio()
-            }
         }
     }
 }
