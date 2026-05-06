@@ -56,10 +56,11 @@ final class SipService: NSObject, ObservableObject {
 
     override init() {
         let config = CXProviderConfiguration()
+        config.localizedName = "MyLine"          // Show app name in CallKit UI, not blank
         config.supportsVideo = false
         config.maximumCallsPerCallGroup = 1
         config.supportedHandleTypes = [.phoneNumber, .generic]
-        config.includesCallsInRecents = true
+        config.includesCallsInRecents = false    // Keep SIP calls out of Phone app's recents
         self.provider = CXProvider(configuration: config)
         super.init()
         self.provider.setDelegate(self, queue: nil)
@@ -459,8 +460,22 @@ extension SipService: CXProviderDelegate {
     nonisolated func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
         Task { @MainActor in
             self.stopRingback()
-            // Give CallKit full ownership of the audio session during the call.
             self.stopSilentAudio()
+
+            // Configure audio session HERE on the main thread — BEFORE dispatching to
+            // ioQueue for startAudioEngine().  This guarantees the hardware has fully
+            // switched to .playAndRecord before inputNode.inputFormat(forBus:0) is
+            // queried, preventing a silent zero-sampleRate failure.
+            do {
+                try audioSession.setCategory(.playAndRecord,
+                                             mode: .voiceChat,
+                                             options: [.allowBluetooth, .allowBluetoothA2DP])
+                try audioSession.setPreferredSampleRate(8000)
+                try audioSession.setPreferredIOBufferDuration(0.02)
+            } catch {
+                Self.log.warning("Audio session didActivate config failed: \(error.localizedDescription, privacy: .public)")
+            }
+
             self.sipHandler.handleAudioActivation()
         }
     }

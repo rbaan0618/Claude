@@ -148,16 +148,15 @@ final class RtpSession {
     // MARK: - Audio session + engine
 
     private func configureAudioSession() {
+        // SipService.provider(_:didActivate:) already configured the session on the
+        // main thread before this runs on ioQueue.  We do a lightweight ensure-active
+        // call only — no category change (would fight CallKit) and no .defaultToSpeaker
+        // (CallKit manages routing; forcing speaker here breaks lock-screen answer).
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(.playAndRecord,
-                                    mode: .voiceChat,
-                                    options: [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker])
-            try session.setPreferredSampleRate(Self.sampleRate)
-            try session.setPreferredIOBufferDuration(0.02)
             try session.setActive(true)
         } catch {
-            Self.log.error("AVAudioSession config failed: \(String(describing: error), privacy: .public)")
+            Self.log.error("AVAudioSession setActive failed: \(String(describing: error), privacy: .public)")
         }
     }
 
