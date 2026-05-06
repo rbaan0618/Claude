@@ -50,7 +50,6 @@ final class RtpSession {
 
     private var receiveThread: Thread?
     private var stopped: Bool = false
-    private var configChangeObserver: NSObjectProtocol?
 
     private var sequenceNumber: UInt16 = 0
     private var timestamp: UInt32 = 0
@@ -122,11 +121,6 @@ final class RtpSession {
     func stop() {
         stopped = true
         receiveThread?.cancel(); receiveThread = nil
-
-        if let obs = configChangeObserver {
-            NotificationCenter.default.removeObserver(obs)
-            configChangeObserver = nil
-        }
 
         engine.inputNode.removeTap(onBus: 0)
         player?.stop()
@@ -209,33 +203,6 @@ final class RtpSession {
             playerNode.play()
         } catch {
             Self.log.error("AVAudioEngine start failed: \(String(describing: error), privacy: .public)")
-        }
-
-        // Engine stops itself when audio route changes (e.g., earpiece →
-        // speaker, headphones plugged in).  We must call start() again or
-        // the call goes silent.  This notification fires whenever the
-        // engine's I/O config changes.
-        configChangeObserver = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange,
-            object: engine,
-            queue: nil
-        ) { [weak self] _ in
-            self?.handleEngineConfigChange()
-        }
-    }
-
-    private func handleEngineConfigChange() {
-        guard !stopped else { return }
-        Self.log.info("Engine config change (likely route switch) — restarting audio")
-        do {
-            if !engine.isRunning {
-                try engine.start()
-            }
-            if let player = player, !player.isPlaying {
-                player.play()
-            }
-        } catch {
-            Self.log.error("Engine restart after config change failed: \(String(describing: error), privacy: .public)")
         }
     }
 
