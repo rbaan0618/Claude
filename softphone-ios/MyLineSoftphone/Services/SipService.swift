@@ -55,8 +55,7 @@ final class SipService: NSObject, ObservableObject {
     private var silentNode:   AVAudioPlayerNode?
 
     override init() {
-        let config = CXProviderConfiguration()
-        config.localizedName = "MyLine"          // Show app name in CallKit UI, not blank
+        let config = CXProviderConfiguration(localizedName: "MyLine")
         config.supportsVideo = false
         config.maximumCallsPerCallGroup = 1
         config.supportedHandleTypes = [.phoneNumber, .generic]
@@ -469,7 +468,7 @@ extension SipService: CXProviderDelegate {
             do {
                 try audioSession.setCategory(.playAndRecord,
                                              mode: .voiceChat,
-                                             options: [.allowBluetooth, .allowBluetoothA2DP])
+                                             options: [.allowBluetoothHFP, .allowBluetoothA2DP])
                 try audioSession.setPreferredSampleRate(8000)
                 try audioSession.setPreferredIOBufferDuration(0.02)
             } catch {
