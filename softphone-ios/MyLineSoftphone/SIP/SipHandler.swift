@@ -402,6 +402,10 @@ final class SipHandler: ObservableObject {
         ioQueue.async { [weak self] in self?.rtpSession?.isMuted = muted }
     }
 
+    func setSpeakerOutput(_ on: Bool) {
+        ioQueue.async { [weak self] in self?.rtpSession?.setSpeakerOutput(on) }
+    }
+
     func toggleHold() {
         ioQueue.async { [weak self] in
             guard let self else { return }

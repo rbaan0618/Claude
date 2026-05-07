@@ -123,13 +123,12 @@ final class SipService: NSObject, ObservableObject {
     /// Uses AVAudioSession.overrideOutputAudioPort which works while CallKit
     /// owns the session (.voiceChat defaults to earpiece; speaker overrides it).
     func setSpeaker(_ on: Bool) {
-        do {
-            try AVAudioSession.sharedInstance()
-                .overrideOutputAudioPort(on ? .speaker : .none)
-            Self.log.info("Speaker \(on ? "ON" : "OFF (earpiece)", privacy: .public)")
-        } catch {
-            Self.log.warning("Speaker override failed: \(error.localizedDescription, privacy: .public)")
-        }
+        // Delegate to SipHandler/RtpSession on the ioQueue so the audio engine
+        // (which lives on that queue) can be restarted on the SAME thread right
+        // after the route override.  Calling overrideOutputAudioPort on the main
+        // thread without restarting the engine kills audio because vpio reconfigures.
+        sipHandler.setSpeakerOutput(on)
+        Self.log.info("Speaker request: \(on ? "ON" : "OFF (earpiece)", privacy: .public)")
     }
 
     // MARK: - App lifecycle (background / foreground)
