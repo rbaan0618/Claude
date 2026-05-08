@@ -142,23 +142,33 @@ final class RtpSession {
     }
 
     /// Toggle output route between earpiece and speaker.
-    /// In .voiceChat mode the Voice Processing I/O unit (vpio) stops the
-    /// engine when the route changes — we must restart it manually here.
+    /// In .voiceChat mode the Voice Processing I/O unit (vpio) leaves the engine
+    /// in a "soft-broken" state on route change — isRunning returns true but
+    /// audio doesn't flow.  Solution: pause BEFORE the override, start AFTER.
+    /// This forces vpio to fully reconfigure for the new route.
     /// Called from SipService.setSpeaker via SipHandler on the ioQueue.
     func setSpeakerOutput(_ on: Bool) {
         let session = AVAudioSession.sharedInstance()
         do {
+            // 1. Pause player + engine (releases vpio cleanly, preserves graph/taps).
+            player?.pause()
+            engine.pause()
+
+            // 2. Change the audio route while engine is idle.
             try session.overrideOutputAudioPort(on ? .speaker : .none)
-            // vpio likely stopped the engine — restart it and the player.
-            if !engine.isRunning {
-                try engine.start()
-            }
-            if let player = player, !player.isPlaying {
-                player.play()
-            }
+
+            // 3. Restart the engine — vpio reconfigures for the new route.
+            try engine.start()
+            player?.play()
+
             Self.log.info("Speaker \(on ? "ON" : "OFF", privacy: .public) — engine running=\(self.engine.isRunning)")
         } catch {
             Self.log.error("setSpeakerOutput failed: \(String(describing: error), privacy: .public)")
+            // Best-effort recovery: try to restart engine if it stopped.
+            if !engine.isRunning {
+                try? engine.start()
+                player?.play()
+            }
         }
     }
 
