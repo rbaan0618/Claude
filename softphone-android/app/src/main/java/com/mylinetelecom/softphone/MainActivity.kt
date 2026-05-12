@@ -492,6 +492,11 @@ fun MainApp(
                                     scope.launch {
                                         database.chatMessageDao().deleteConversation(number, type)
                                     }
+                                },
+                                onClearAll = { type ->
+                                    scope.launch {
+                                        database.chatMessageDao().deleteByType(type)
+                                    }
                                 }
                             )
                         }

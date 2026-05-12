@@ -196,3 +196,26 @@ def mark_chat_read(peer, message_type="sms"):
         conn.commit()
     finally:
         conn.close()
+
+
+def delete_conversation(peer, message_type="sms"):
+    """Delete all messages in a single conversation."""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "DELETE FROM chat_messages WHERE peer = ? AND message_type = ?",
+            (peer, message_type)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_all_messages():
+    """Delete every chat message across all channels."""
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM chat_messages")
+        conn.commit()
+    finally:
+        conn.close()

@@ -12,6 +12,7 @@ from datetime import datetime
 from gui.theme import get_theme
 from utils.database import (
     add_chat_message, get_chats, get_messages, mark_chat_read,
+    delete_conversation, clear_all_messages,
 )
 
 # WhatsApp brand green; SMS uses theme accent (blue)
@@ -88,6 +89,10 @@ class MessagesPanel(tk.Frame):
                            bg=c["bg_secondary"], fg=c["accent"], cursor="hand2")
         add_btn.pack(side=tk.RIGHT)
         add_btn.bind("<Button-1>", lambda e: self._new_message_dialog())
+        trash_btn = tk.Label(header, text="🗑", font=("Segoe UI", 11),
+                             bg=c["bg_secondary"], fg=c["fg_dim"], cursor="hand2")
+        trash_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        trash_btn.bind("<Button-1>", lambda e: self._clear_all_dialog())
 
         # ---- SMS / WhatsApp tabs ----
         tab_bar = tk.Frame(self, bg=c["bg_secondary"])
@@ -187,8 +192,10 @@ class MessagesPanel(tk.Frame):
 
         peer = chat["peer"]
         channel = self._active_channel
-        for w in [row, top, bottom] + list(top.winfo_children()) + list(bottom.winfo_children()):
+        all_widgets = [row, top, bottom] + list(top.winfo_children()) + list(bottom.winfo_children())
+        for w in all_widgets:
             w.bind("<Button-1>", lambda e, p=peer, ch=channel: self.open_chat(p, ch))
+            w.bind("<Button-3>", lambda e, p=peer, ch=channel: self._row_context_menu(e, p, ch))
 
     # ---- Public API ----
 
@@ -243,6 +250,59 @@ class MessagesPanel(tk.Frame):
         if self._on_send:
             self._on_send(peer, text, channel)
         return True
+
+    def _row_context_menu(self, event, peer, channel):
+        """Right-click context menu on a conversation row."""
+        c = self.colors
+        menu = tk.Menu(self, tearoff=0, bg=c["bg"], fg=c["fg"],
+                       activebackground=c["accent"], activeforeground="#ffffff")
+        menu.add_command(
+            label=f"Delete conversation",
+            command=lambda: self._delete_conversation(peer, channel),
+        )
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _delete_conversation(self, peer, channel):
+        """Delete one conversation after confirmation."""
+        import tkinter.messagebox as mb
+        ch_label = "WhatsApp" if channel == "whatsapp" else "SMS"
+        if mb.askyesno("Delete conversation",
+                       f"Delete all {ch_label} messages with {peer}?",
+                       parent=self.winfo_toplevel()):
+            # Close the chat window if open
+            key = (peer, channel)
+            win = self._chat_windows.pop(key, None)
+            if win and win.winfo_exists():
+                win.destroy()
+            delete_conversation(peer, channel)
+            self.refresh()
+
+    def _clear_all_dialog(self):
+        """Prompt then wipe every message in the active channel."""
+        import tkinter.messagebox as mb
+        ch_label = "WhatsApp" if self._active_channel == "whatsapp" else "SMS"
+        if mb.askyesno("Clear all messages",
+                       f"Delete ALL {ch_label} conversations? This cannot be undone.",
+                       parent=self.winfo_toplevel()):
+            # Close all open chat windows for this channel
+            to_close = [k for k in list(self._chat_windows)
+                        if k[1] == self._active_channel]
+            for k in to_close:
+                win = self._chat_windows.pop(k, None)
+                if win and win.winfo_exists():
+                    win.destroy()
+            # Delete only the active channel's messages
+            import sqlite3, os
+            from config import DB_FILE
+            from utils.database import get_connection
+            conn = get_connection()
+            try:
+                conn.execute("DELETE FROM chat_messages WHERE message_type = ?",
+                             (self._active_channel,))
+                conn.commit()
+            finally:
+                conn.close()
+            self.refresh()
 
     def _new_message_dialog(self):
         c = self.colors

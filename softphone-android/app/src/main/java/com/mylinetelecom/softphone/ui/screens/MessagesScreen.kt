@@ -31,11 +31,32 @@ fun MessagesScreen(
     contacts: List<Contact>,
     onOpenChat: (number: String, type: String) -> Unit,
     onNewMessage: () -> Unit,
-    onDeleteConversation: (number: String, type: String) -> Unit
+    onDeleteConversation: (number: String, type: String) -> Unit,
+    onClearAll: (type: String) -> Unit = {}
 ) {
     val contactMap = remember(contacts) { contacts.associateBy { it.number } }
     var selectedTab by remember { mutableIntStateOf(0) }
     val tabs = listOf("SMS", "WhatsApp")
+    var showClearConfirm by remember { mutableStateOf(false) }
+
+    // Clear-all confirmation dialog
+    if (showClearConfirm) {
+        val activeType = if (selectedTab == 0) "sms" else "whatsapp"
+        val label = if (selectedTab == 0) "SMS" else "WhatsApp"
+        AlertDialog(
+            onDismissRequest = { showClearConfirm = false },
+            title = { Text("Clear all $label messages") },
+            text = { Text("Delete ALL $label conversations? This cannot be undone.") },
+            confirmButton = {
+                TextButton(onClick = { showClearConfirm = false; onClearAll(activeType) }) {
+                    Text("Delete all", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearConfirm = false }) { Text("Cancel") }
+            }
+        )
+    }
 
     Column(modifier = Modifier.fillMaxSize()) {
         // Header
@@ -47,8 +68,14 @@ fun MessagesScreen(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text("Messages", fontSize = 24.sp, color = MaterialTheme.colorScheme.onSurface)
-            IconButton(onClick = onNewMessage) {
-                Icon(Icons.Default.Edit, "New message", tint = BrandPrimary)
+            Row {
+                IconButton(onClick = { showClearConfirm = true }) {
+                    Icon(Icons.Default.DeleteSweep, "Clear all",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                IconButton(onClick = onNewMessage) {
+                    Icon(Icons.Default.Edit, "New message", tint = BrandPrimary)
+                }
             }
         }
 

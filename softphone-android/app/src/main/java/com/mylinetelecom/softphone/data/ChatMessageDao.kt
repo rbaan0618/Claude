@@ -43,6 +43,9 @@ interface ChatMessageDao {
     @Query("DELETE FROM chat_messages WHERE remoteNumber = :number AND messageType = :type")
     suspend fun deleteConversation(number: String, type: String)
 
+    @Query("DELETE FROM chat_messages WHERE messageType = :type")
+    suspend fun deleteByType(type: String)
+
     @Query("DELETE FROM chat_messages")
     suspend fun deleteAll()
 }
