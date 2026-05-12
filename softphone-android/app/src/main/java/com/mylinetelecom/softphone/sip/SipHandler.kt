@@ -464,7 +464,7 @@ class SipHandler(
 
     // ==================== CALL MANAGEMENT ====================
 
-    fun sendMessage(recipient: String, text: String) {
+    fun sendMessage(recipient: String, text: String, channel: String = "sms") {
         if (_registrationState.value != RegistrationState.REGISTERED) {
             Log.w(TAG, "Cannot send message — not registered")
             return
@@ -473,6 +473,7 @@ class SipHandler(
             val msgCallId = generateCallId()
             val fromTag = generateTag()
             val contactAddr = contactAddress()
+            val safeChannel = if (channel == "whatsapp") "whatsapp" else "sms"
             val pending = PendingMessage(
                 recipient = recipient,
                 text = text,
@@ -490,12 +491,13 @@ class SipHandler(
                 fromTag = fromTag,
                 extraHeaders = mapOf(
                     "Contact" to "<sip:${config.username}@$contactAddr>",
-                    "Content-Type" to "text/plain"
+                    "Content-Type" to "text/plain",
+                    "X-Channel" to safeChannel      // tells sms_send.php the delivery channel
                 ),
                 body = text
             )
             sendSip(request)
-            Log.i(TAG, "Sent MESSAGE to $recipient: ${text.take(50)}")
+            Log.i(TAG, "Sent $safeChannel MESSAGE to $recipient: ${text.take(50)}")
         }
     }
 

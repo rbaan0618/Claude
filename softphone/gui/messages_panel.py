@@ -4,6 +4,7 @@ Two tabs: SMS (blue accent) and WhatsApp (green).  Each conversation opens a
 ChatWindow Toplevel.  Messages are persisted in SQLite via utils.database.
 """
 
+import re
 import time
 import tkinter as tk
 from datetime import datetime
@@ -16,6 +17,24 @@ from utils.database import (
 # WhatsApp brand green; SMS uses theme accent (blue)
 WHATSAPP_GREEN = "#25D366"
 WHATSAPP_DARK  = "#128C7E"
+
+
+def _normalize_whatsapp_peer(peer: str) -> str:
+    """Ensure a WhatsApp number is stored with a '+' prefix.
+
+    The server delivers inbound WhatsApp messages with the From number in
+    '+E.164' format (e.g. +13059684280).  We normalise outbound peers the
+    same way so that sent and received messages share the same DB key and
+    appear in one conversation thread instead of two.
+    """
+    if peer.startswith("+"):
+        return peer                          # already normalised
+    digits = re.sub(r"[^0-9]", "", peer)
+    if len(digits) == 10:
+        return "+1" + digits                 # US 10-digit → +1XXXXXXXXXX
+    if len(digits) == 11 and digits[0] == "1":
+        return "+" + digits                  # US 11-digit  → +1XXXXXXXXXX
+    return "+" + digits                      # other: just add '+'
 
 
 def _format_time(ts):
@@ -156,6 +175,10 @@ class MessagesPanel(tk.Frame):
 
     def open_chat(self, peer, channel=None):
         channel = channel or self._active_channel
+        # Normalise WhatsApp peer to '+E.164' so outbound and inbound share
+        # the same DB key (server delivers inbound with '+' prefix).
+        if channel == "whatsapp":
+            peer = _normalize_whatsapp_peer(peer)
         key = (peer, channel)
         win = self._chat_windows.get(key)
         if win and win.winfo_exists():
@@ -187,17 +210,17 @@ class MessagesPanel(tk.Frame):
     # ---- Internal ----
 
     def _send_from_window(self, peer, text, channel):
-        if not self._on_send:
-            return False
-        ok = self._on_send(peer, text, channel)
-        if ok:
-            add_chat_message(peer, "out", text, time.time(), message_type=channel)
-            self.refresh()
-            key = (peer, channel)
-            win = self._chat_windows.get(key)
-            if win and win.winfo_exists():
-                win.reload()
-        return ok
+        # Always persist the outbound message locally first — it must appear in
+        # the conversation even if SIP delivery fails (mirrors Android behaviour).
+        add_chat_message(peer, "out", text, time.time(), message_type=channel)
+        self.refresh()
+        key = (peer, channel)
+        win = self._chat_windows.get(key)
+        if win and win.winfo_exists():
+            win.reload()
+        if self._on_send:
+            self._on_send(peer, text, channel)
+        return True
 
     def _new_message_dialog(self):
         c = self.colors

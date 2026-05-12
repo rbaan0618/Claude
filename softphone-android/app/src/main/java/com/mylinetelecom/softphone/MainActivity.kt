@@ -444,26 +444,32 @@ fun MainApp(
                                 messages = chatMessages,
                                 onSendMessage = { text ->
                                     scope.launch {
-                                        val number = chatNumber!!
-                                        // WhatsApp: 11 digits with leading 1 (e.g. 13059684280)
-                                        // '+' gets stripped by FreeSWITCH — use digit count to distinguish
-                                        // SMS: 10 digits (strip +1 if present)
+                                        val rawNumber = chatNumber!!
+                                        // Normalise WhatsApp peer to '+E.164' format so outbound
+                                        // DB keys match inbound (server delivers with '+' prefix).
+                                        val storedNumber = if (chatType == "whatsapp")
+                                            normalizeWhatsAppNumber(rawNumber) else rawNumber
+
+                                        // Build the SIP recipient:
+                                        //   WhatsApp → 11 digits (leading 1); sms_send.php keeps it
+                                        //   SMS      → 10 digits; sms_send.php forces SMS delivery
                                         val sipRecipient = if (chatType == "whatsapp") {
-                                            val digits = number.replace(Regex("[^0-9]"), "")
+                                            val digits = storedNumber.replace(Regex("[^0-9]"), "")
                                             if (digits.length == 10) "1$digits" else digits
                                         } else {
-                                            val digits = number.replace(Regex("[^0-9]"), "")
+                                            val digits = rawNumber.replace(Regex("[^0-9]"), "")
                                             if (digits.length == 11 && digits.startsWith("1")) digits.substring(1) else digits
                                         }
                                         val msg = ChatMessage(
-                                            remoteNumber = number,
+                                            remoteNumber = storedNumber,   // normalised key
                                             body = text,
                                             isOutgoing = true,
                                             status = MessageStatus.SENT,
                                             messageType = chatType
                                         )
                                         database.chatMessageDao().insert(msg)
-                                        sipService?.sipHandler?.sendMessage(sipRecipient, text)
+                                        // Pass channel so SipHandler sends X-Channel header
+                                        sipService?.sipHandler?.sendMessage(sipRecipient, text, chatType)
                                     }
                                 },
                                 onBack = { chatNumber = null },
@@ -564,7 +570,9 @@ fun MainApp(
             onDismiss = { showNewMessageDialog = false },
             onStartChat = { number, type ->
                 showNewMessageDialog = false
-                chatNumber = number
+                // Normalise WhatsApp numbers immediately so the first message
+                // is stored under the same '+E.164' key as any later inbound reply.
+                chatNumber = if (type == "whatsapp") normalizeWhatsAppNumber(number) else number
                 chatType = type
                 currentScreen = "messages"
             }
@@ -633,4 +641,22 @@ private fun NewMessageDialog(
             }
         }
     )
+}
+
+/**
+ * Normalise a phone number to '+E.164' format for WhatsApp storage.
+ *
+ * The FusionPBX/FreeSWITCH server delivers inbound WhatsApp messages with the
+ * From number in '+E.164' form (e.g. +13059684280).  Storing outbound messages
+ * under the same format ensures sent and received messages share one DB key and
+ * appear together in a single conversation thread.
+ */
+private fun normalizeWhatsAppNumber(number: String): String {
+    if (number.startsWith("+")) return number          // already normalised
+    val digits = number.replace(Regex("[^0-9]"), "")
+    return when {
+        digits.length == 10 -> "+1$digits"             // US 10-digit → +1XXXXXXXXXX
+        digits.length == 11 && digits.startsWith("1") -> "+$digits"  // US 11-digit
+        else -> "+$digits"                             // international: just add '+'
+    }
 }
