@@ -227,6 +227,14 @@ class MessagesPanel(tk.Frame):
 
     def on_incoming_message(self, peer, body, timestamp, channel="sms"):
         """Called by the main window when an inbound SIP MESSAGE arrives."""
+        # Normalise peer so inbound and outbound share the same DB key.
+        # WhatsApp inbound arrives with '+' (keep it); SMS inbound may arrive
+        # with an 11-digit US number — strip the leading 1 to match what we
+        # store for outbound (10-digit format used for Thinq SMS routing).
+        if channel == "whatsapp":
+            peer = _normalize_whatsapp_peer(peer)
+        else:
+            peer = _normalize_sms_peer(peer)
         add_chat_message(peer, "in", body, timestamp, read=0, message_type=channel)
         self.refresh()
         key = (peer, channel)
