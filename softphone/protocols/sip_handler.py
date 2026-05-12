@@ -395,6 +395,8 @@ class SipHandler(ProtocolHandler):
         self._pending_keepalives = 0  # incremented each send, cleared on any server response
         # Outbound MESSAGE tracking (for 401 auth retry)
         self._pending_messages = {}  # call_id -> {recipient, text, auth_attempted}
+        # Inbound MESSAGE deduplication: (from_user, body) -> last_seen timestamp
+        self._recent_messages = {}   # (from_user, body) -> float timestamp
 
     @property
     def protocol_name(self) -> str:
@@ -1918,13 +1920,31 @@ class SipHandler(ProtocolHandler):
                 m = re.search(r"sip:([^@>;\s]+)@", from_header)
                 if m:
                     from_user = m.group(1)
-                # Read channel from X-Channel header (sms_send.php sets this too
-                # when delivering inbound messages through FusionPBX)
-                channel = headers.get("x-channel", "sms").strip().lower()
-                if channel not in ("sms", "whatsapp"):
-                    channel = "sms"
+
+                # Determine channel the same way Android does (SipService.kt line 138):
+                #   WhatsApp inbound arrives with '+' prefix in the From number
+                #   (e.g. +13059684280) — SMS arrives without it (e.g. 13059684280).
+                # X-Channel header is a fallback for servers that set it explicitly.
+                x_channel = headers.get("x-channel", "").strip().lower()
+                if x_channel in ("sms", "whatsapp"):
+                    channel = x_channel
+                else:
+                    channel = "whatsapp" if from_user.startswith("+") else "sms"
+
+                # Deduplicate SIP retransmissions — skip identical body from same
+                # sender if it already arrived within the last 5 seconds
+                now = time.time()
+                dedup_key = (from_user, body)
+                last_ts = self._recent_messages.get(dedup_key, 0)
+                if now - last_ts < 5.0:
+                    logger.debug("Duplicate inbound MESSAGE from %s — ignored", from_user)
+                    return
+                self._recent_messages[dedup_key] = now
+
+                logger.info("Incoming %s MESSAGE from %s: %s",
+                            channel, from_user, body[:80])
                 if self._on_message_received and body:
-                    self._on_message_received("SIP", from_user, body, time.time(), channel)
+                    self._on_message_received("SIP", from_user, body, now, channel)
             except Exception as e:
                 logger.error("Error dispatching incoming MESSAGE: %s", e)
 
