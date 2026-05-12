@@ -13,6 +13,7 @@ from gui.in_call_view import InCallView
 from gui.blf_panel import BlfPanel
 from gui.contacts_panel import ContactsPanel
 from gui.messages_panel import MessagesPanel
+from gui.notification_toast import NotificationToast
 from gui.call_history import CallHistoryPanel
 from gui.settings_dialog import SettingsDialog
 from protocols.sip_handler import SipHandler
@@ -543,6 +544,18 @@ class MainWindow:
                                                     channel=channel)
             ch_label = "WhatsApp" if channel == "whatsapp" else "SMS"
             self.status_var.set(f"New {ch_label} from {from_user}")
+
+            # Toast notification — clicking it switches to Messages tab and
+            # opens the conversation window for this sender.
+            def _open_from_toast():
+                self._switch_left_tab("Messages")
+                self.messages_panel.open_chat(from_user, channel)
+
+            NotificationToast(
+                self.root, from_user, body, channel,
+                self.colors, on_click=_open_from_toast,
+            )
+
         self.root.after(0, _update)
 
     def _send_sip_message(self, peer, text, channel="sms"):
