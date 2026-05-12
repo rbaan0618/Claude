@@ -26,6 +26,10 @@ def _normalize_whatsapp_peer(peer: str) -> str:
     '+E.164' format (e.g. +13059684280).  We normalise outbound peers the
     same way so that sent and received messages share the same DB key and
     appear in one conversation thread instead of two.
+
+    A '+'-prefixed 11-digit number is also what sms_send.php passes to Thinq
+    as the omnichannel (WhatsApp) recipient.  The '+' gets stripped to digits
+    by the PHP script, leaving 11 digits which triggers WhatsApp delivery.
     """
     if peer.startswith("+"):
         return peer                          # already normalised
@@ -35,6 +39,21 @@ def _normalize_whatsapp_peer(peer: str) -> str:
     if len(digits) == 11 and digits[0] == "1":
         return "+" + digits                  # US 11-digit  → +1XXXXXXXXXX
     return "+" + digits                      # other: just add '+'
+
+
+def _normalize_sms_peer(peer: str) -> str:
+    """Normalise an SMS number to 10 digits (no country code).
+
+    sms_send.php passes the TO number to Thinq as 10 digits for SMS.
+    Sending 11 digits without an explicit channel=sms header would trigger
+    Thinq's omnichannel lookup and potentially deliver via WhatsApp.
+    Stripping the leading '1' here ensures SMS always hits the right format
+    regardless of whether FreeSWITCH forwards the X-Channel header.
+    """
+    digits = re.sub(r"[^0-9]", "", peer)
+    if len(digits) == 11 and digits[0] == "1":
+        return digits[1:]                    # US 11-digit → strip leading 1
+    return digits                            # 10-digit or other: keep as-is
 
 
 def _format_time(ts):
@@ -175,10 +194,13 @@ class MessagesPanel(tk.Frame):
 
     def open_chat(self, peer, channel=None):
         channel = channel or self._active_channel
-        # Normalise WhatsApp peer to '+E.164' so outbound and inbound share
-        # the same DB key (server delivers inbound with '+' prefix).
+        # Normalise peer so outbound DB keys match inbound delivery format:
+        #   WhatsApp → '+E.164' (server sends inbound with '+' prefix)
+        #   SMS      → 10-digit (sms_send.php / Thinq expects 10-digit for SMS)
         if channel == "whatsapp":
             peer = _normalize_whatsapp_peer(peer)
+        else:
+            peer = _normalize_sms_peer(peer)
         key = (peer, channel)
         win = self._chat_windows.get(key)
         if win and win.winfo_exists():
