@@ -52,6 +52,19 @@ struct ChatMessageDao {
             .eraseToAnyPublisher()
     }
 
+    // MARK: - WhatsApp template guard (mirrors Android countInbound)
+
+    /// Returns the number of inbound messages from `remoteNumber` on a given channel.
+    /// Zero means the contact has never messaged us — Meta will reject free-form
+    /// messages in this case (error 131047); the caller should send a template instead.
+    func countInbound(remoteNumber: String, messageType: String) throws -> Int {
+        try dbQueue.read { db in
+            try Int.fetchOne(db,
+                sql: "SELECT COUNT(*) FROM chat_messages WHERE remoteNumber = ? AND messageType = ? AND isOutgoing = 0",
+                arguments: [remoteNumber, messageType]) ?? 0
+        }
+    }
+
     // MARK: - Deduplication (mirrors Android countRecentDuplicates)
 
     func countRecentDuplicates(from number: String, body: String, since: Date) throws -> Int {

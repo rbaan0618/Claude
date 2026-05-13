@@ -10,6 +10,7 @@ struct ChatDetailScreen: View {
     @State private var messages: [ChatMessage] = []
     @State private var draft = ""
     @State private var cancellable: AnyCancellable?
+    @State private var showTemplateAlert = false
 
     private let dao = ChatMessageDao()
 
@@ -88,17 +89,58 @@ struct ChatDetailScreen: View {
                 .sink { messages = $0 }
         }
         .onDisappear { cancellable = nil }
+        // WhatsApp template dialog — shown when no prior inbound messages exist
+        .alert("WhatsApp — new conversation", isPresented: $showTemplateAlert) {
+            Button("Send Template") { sendTemplate() }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text(
+                "\(remoteNumber) has not messaged you on WhatsApp yet.\n\n" +
+                "Meta will not deliver a free-form message to start a new conversation. " +
+                "Send the pre-approved template instead?\n\n" +
+                "The template reads:\n" +
+                "\"We would like to connect with you. " +
+                "Please reply to this message so we can assist you.\"\n\n" +
+                "Once they reply you can send any message normally."
+            )
+        }
     }
 
     private func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
+
+        // WhatsApp template guard: Meta blocks free-form messages to contacts
+        // that have never messaged us first (error 131047).
+        if isWhatsApp {
+            let inboundCount = (try? dao.countInbound(remoteNumber: remoteNumber, messageType: "whatsapp")) ?? 0
+            if inboundCount == 0 {
+                showTemplateAlert = true
+                return
+            }
+        }
+
+        performSend(text: text)
+        draft = ""
+    }
+
+    private func performSend(text: String) {
         service.sipHandler.sendMessage(to: remoteNumber, text: text, messageType: messageType)
         let msg = ChatMessage(remoteNumber: remoteNumber, body: text,
                               isOutgoing: true, timestamp: Date(),
                               status: .sent, messageType: messageType)
         _ = try? dao.insert(msg)
-        draft = ""
+    }
+
+    private func sendTemplate() {
+        let templateBody = "__TEMPLATE__:initial_contact:en"
+        let displayText  = "[Template] We would like to connect with you. " +
+                           "Please reply to this message so we can assist you."
+        service.sipHandler.sendMessage(to: remoteNumber, text: templateBody, messageType: "whatsapp")
+        let msg = ChatMessage(remoteNumber: remoteNumber, body: displayText,
+                              isOutgoing: true, timestamp: Date(),
+                              status: .sent, messageType: "whatsapp")
+        _ = try? dao.insert(msg)
     }
 }
 
