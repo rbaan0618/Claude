@@ -64,6 +64,27 @@ $user_uuid = $row['user_uuid'] ?? null;
 
 error_log("[SMS] Extension $from_ext -> DID $message_from -> $to (channel: $channel)");
 
+// ── WhatsApp template shortcut ────────────────────────────────────────────────
+// When template= param is present the softphone wants to send a pre-approved
+// WhatsApp template (first contact / re-engagement).  Bypass the FusionPBX
+// message queue and call send.php directly — no provider lookup needed.
+$template_name = trim($args['template'] ?? '');
+$template_lang = trim($args['lang']     ?? 'en_US');
+if ($template_name && $channel === 'whatsapp') {
+    $send_php = '/var/www/fusionpbx/app/whatsapp/send.php';
+    $cmd = sprintf(
+        "php %s --from=%s --to=%s --template=%s --lang=%s >> /tmp/sms_outbound.log 2>&1",
+        $send_php,
+        escapeshellarg($message_from),
+        escapeshellarg($to),
+        escapeshellarg($template_name),
+        escapeshellarg($template_lang)
+    );
+    error_log("[SMS] Template send: $template_name from $message_from to $to");
+    system($cmd);
+    exit(0);
+}
+
 // Find provider_uuid from v_destinations matching the DID
 $sql  = "SELECT provider_uuid, group_uuid FROM v_destinations ";
 $sql .= "WHERE domain_uuid = :domain_uuid AND destination_enabled = 'true' AND provider_uuid IS NOT NULL ";

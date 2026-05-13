@@ -198,6 +198,26 @@ def mark_chat_read(peer, message_type="sms"):
         conn.close()
 
 
+def has_inbound_messages(peer, message_type="sms"):
+    """Return True if at least one inbound message from peer exists on this channel.
+
+    Used to detect business-initiated WhatsApp conversations: Meta's Cloud API
+    only delivers free-form messages as replies within the 24-hour customer
+    service window.  When there are no inbound messages we know we are trying
+    to start a new conversation and should warn the user / fall back to SMS.
+    """
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM chat_messages "
+            "WHERE peer = ? AND message_type = ? AND direction = 'in'",
+            (peer, message_type)
+        ).fetchone()
+        return row[0] > 0
+    finally:
+        conn.close()
+
+
 def delete_conversation(peer, message_type="sms"):
     """Delete all messages in a single conversation."""
     conn = get_connection()

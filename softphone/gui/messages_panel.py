@@ -12,7 +12,7 @@ from datetime import datetime
 from gui.theme import get_theme
 from utils.database import (
     add_chat_message, get_chats, get_messages, mark_chat_read,
-    delete_conversation, clear_all_messages,
+    delete_conversation, clear_all_messages, has_inbound_messages,
 )
 
 # WhatsApp brand green; SMS uses theme accent (blue)
@@ -247,6 +247,52 @@ class MessagesPanel(tk.Frame):
     # ---- Internal ----
 
     def _send_from_window(self, peer, text, channel):
+        import tkinter.messagebox as mb
+
+        # ── WhatsApp business-initiated guard ─────────────────────────────────
+        # Meta's Cloud API silently drops free-form messages when no inbound
+        # message has been received from this peer (24-hour window not open).
+        # Offer to send a pre-approved template instead — this always delivers
+        # and opens the window so the agent can reply freely after the customer
+        # responds.
+        if channel == "whatsapp" and not has_inbound_messages(peer, "whatsapp"):
+            send_tmpl = mb.askyesno(
+                "WhatsApp — new conversation",
+                f"{peer} has not messaged you on WhatsApp yet.\n\n"
+                "Meta will not deliver a free-form message to start a new\n"
+                "conversation.  Send the pre-approved template instead?\n\n"
+                "The template reads:\n"
+                "\"We would like to connect with you. Please reply to this\n"
+                " message so we can assist you.\"\n\n"
+                "Once they reply you can send any message normally.",
+                icon="question",
+                parent=self.winfo_toplevel(),
+            )
+            if not send_tmpl:
+                return False          # user cancelled — do nothing
+            # Send the template marker — index.lua routes this to send.php
+            # with --template=initial_contact, bypassing the message queue.
+            TEMPLATE_NAME = "initial_contact"
+            TEMPLATE_LANG = "en_US"
+            TEMPLATE_BODY = (
+                "We would like to connect with you. "
+                "Please reply to this message so we can assist you."
+            )
+            # Save locally so the chat shows what the customer will receive
+            add_chat_message(peer, "out", f"[Template] {TEMPLATE_BODY}",
+                             time.time(), message_type=channel)
+            self.refresh()
+            key = (peer, channel)
+            win = self._chat_windows.get(key)
+            if win and win.winfo_exists():
+                win.reload()
+            # Fire the SIP message with the special template body
+            if self._on_send:
+                self._on_send(peer,
+                              f"__TEMPLATE__:{TEMPLATE_NAME}:{TEMPLATE_LANG}",
+                              channel)
+            return True
+
         # Always persist the outbound message locally first — it must appear in
         # the conversation even if SIP delivery fails (mirrors Android behaviour).
         add_chat_message(peer, "out", text, time.time(), message_type=channel)
