@@ -161,6 +161,22 @@ final class SipHandler: ObservableObject {
         }
     }
 
+    /// Builds the Contact URI with dSIPRouter/Kamailio push-notification parameters
+    /// embedded inside the angle brackets — the same format Acrobits uses.
+    /// dSIPRouter reads pn-provider / pn-param / pn-prid to send APNs push when
+    /// the app is suspended, without any FusionPBX changes.
+    ///
+    ///   sip:230@ip:port;transport=udp;pn-provider=apns;pn-param=com.mylinetelecom.softphone.voip;pn-prid=TOKEN
+    private func buildContactUri(addr: String) -> String {
+        var uri = "sip:\(config.username)@\(addr);transport=\(config.transport.lowercased())"
+        if !voipPushToken.isEmpty {
+            uri += ";pn-provider=apns"
+            uri += ";pn-param=com.mylinetelecom.softphone.voip"
+            uri += ";pn-prid=\(voipPushToken)"
+        }
+        return uri
+    }
+
     // MARK: - Public API
 
     func configure(_ sipConfig: SipConfig) {
@@ -1362,14 +1378,11 @@ final class SipHandler: ObservableObject {
         registerFromTag = generateTag()
         registerCseq = 1
         let contactAddr = contactAddress()
+        let contactUri = buildContactUri(addr: contactAddr)
         var headers: [(String, String)] = [
-            ("Contact", "<sip:\(config.username)@\(contactAddr);transport=\(config.transport.lowercased())>"),
+            ("Contact", "<\(contactUri)>"),
             ("Expires", String(Self.registerExpiresSeconds)),
         ]
-        if !voipPushToken.isEmpty {
-            headers.append(("X-Push-Token", voipPushToken))
-            headers.append(("X-Push-Type", "apple"))
-        }
         let req = buildRequest(
             method: "REGISTER",
             requestUri: "sip:\(config.domain)",
@@ -1417,16 +1430,13 @@ final class SipHandler: ObservableObject {
     /// current push token. Used when the push token arrives after initial registration.
     private func sendRegisterWithCurrentAuth() {
         let contactAddr = contactAddress()
+        let contactUri = buildContactUri(addr: contactAddr)
         var headers: [(String, String)] = [
-            ("Contact", "<sip:\(config.username)@\(contactAddr);transport=\(config.transport.lowercased())>"),
+            ("Contact", "<\(contactUri)>"),
             ("Expires", String(Self.registerExpiresSeconds)),
         ]
         if !authNonce.isEmpty {
             headers.append(("Authorization", buildAuthHeader(method: "REGISTER", uri: "sip:\(config.domain)")))
-        }
-        if !voipPushToken.isEmpty {
-            headers.append(("X-Push-Token", voipPushToken))
-            headers.append(("X-Push-Type", "apple"))
         }
         let req = buildRequest(
             method: "REGISTER",
@@ -1447,17 +1457,14 @@ final class SipHandler: ObservableObject {
     private func registerWithAuth(isProxy: Bool) {
         registerCseq += 1
         let contactAddr = contactAddress()
+        let contactUri = buildContactUri(addr: contactAddr)
         let authHeader = buildAuthHeader(method: "REGISTER", uri: "sip:\(config.domain)")
         let headerName = isProxy ? "Proxy-Authorization" : "Authorization"
         var headers: [(String, String)] = [
-            ("Contact", "<sip:\(config.username)@\(contactAddr);transport=\(config.transport.lowercased())>"),
+            ("Contact", "<\(contactUri)>"),
             ("Expires", String(Self.registerExpiresSeconds)),
             (headerName, authHeader),
         ]
-        if !voipPushToken.isEmpty {
-            headers.append(("X-Push-Token", voipPushToken))
-            headers.append(("X-Push-Type", "apple"))
-        }
         let req = buildRequest(
             method: "REGISTER",
             requestUri: "sip:\(config.domain)",
