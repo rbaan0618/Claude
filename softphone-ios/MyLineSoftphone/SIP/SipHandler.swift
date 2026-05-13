@@ -26,11 +26,12 @@ final class SipHandler: ObservableObject {
 
     // MARK: - Constants
 
-    /// 3600 s (1 hour) — long enough that the FusionPBX registration
-    /// (via the dSIPRouter Path) stays valid while the app is suspended.
-    /// PushKit wakes the app for incoming calls; re-REGISTER fires at
-    /// (3600 - 30) s = 59.5 min when the app is active.
-    private static let registerExpiresSeconds = 3600
+    /// 300 s — standard for mobile: short enough to re-register quickly
+    /// after a network change (WiFi → LTE, roaming, IP change).
+    /// dSIPRouter forwards the REGISTER to FusionPBX with its own stable
+    /// address (sbc.myline.tel) and Expires=3600, so FusionPBX keeps the
+    /// route alive for 1 hour while the device is suspended.
+    private static let registerExpiresSeconds = 300
     /// OPTIONS keepalive every 15 s keeps the UDP NAT hole open while
     /// the app is in the foreground or running an active audio call.
     private static let keepaliveIntervalSeconds: Int = 15
