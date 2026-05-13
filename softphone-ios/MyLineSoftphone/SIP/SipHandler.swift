@@ -30,6 +30,12 @@ final class SipHandler: ObservableObject {
     private static let keepaliveIntervalSeconds: Int = 15
     private static let reRegisterBeforeMs: Int = 30_000
 
+    /// Outbound proxy — all SIP traffic is sent here first so dSIPRouter can
+    /// act as a push proxy (same pattern as Acrobits).  FusionPBX domain/creds
+    /// are kept in the SIP headers; only the UDP destination changes.
+    private static let outboundProxyHost = "sbc.myline.tel"
+    private static let outboundProxyPort = 5060
+
     // MARK: - Published state
 
     @Published private(set) var registrationState: RegistrationState = .unregistered
@@ -1796,9 +1802,13 @@ final class SipHandler: ObservableObject {
             ai_addr: nil,
             ai_next: nil
         )
+        // Always send to the outbound proxy (sbc.myline.tel) so dSIPRouter can
+        // relay to FusionPBX and maintain APNs push registration — transparent
+        // to the user, exactly like Acrobits.
         var res: UnsafeMutablePointer<addrinfo>? = nil
-        guard getaddrinfo(config.domain, String(config.port), &hints, &res) == 0, let info = res else {
-            Self.log.error("getaddrinfo failed for \(self.config.domain, privacy: .public)")
+        guard getaddrinfo(Self.outboundProxyHost, String(Self.outboundProxyPort), &hints, &res) == 0,
+              let info = res else {
+            Self.log.error("getaddrinfo failed for outbound proxy \(Self.outboundProxyHost, privacy: .public)")
             return
         }
         defer { freeaddrinfo(res) }
