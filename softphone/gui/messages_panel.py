@@ -273,7 +273,7 @@ class MessagesPanel(tk.Frame):
             # Send the template marker — index.lua routes this to send.php
             # with --template=initial_contact, bypassing the message queue.
             TEMPLATE_NAME = "initial_contact"
-            TEMPLATE_LANG = "en_US"
+            TEMPLATE_LANG = "en"
             TEMPLATE_BODY = (
                 "We would like to connect with you. "
                 "Please reply to this message so we can assist you."
