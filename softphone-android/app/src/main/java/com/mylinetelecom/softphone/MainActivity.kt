@@ -236,6 +236,7 @@ fun MainApp(
     var chatNumber by remember { mutableStateOf<String?>(null) }
     var chatType   by remember { mutableStateOf("sms") }     // "sms" or "whatsapp"
     var showNewMessageDialog by remember { mutableStateOf(false) }
+    var showWhatsAppTemplateDialog by remember { mutableStateOf(false) }
 
     // Handle notification tap — navigate to chat
     LaunchedEffect(pendingChatNumber.value) {
@@ -450,6 +451,18 @@ fun MainApp(
                                         val storedNumber = if (chatType == "whatsapp")
                                             normalizeWhatsAppNumber(rawNumber) else rawNumber
 
+                                        // WhatsApp template guard: Meta blocks free-form messages
+                                        // to contacts that have never messaged us first.
+                                        // If no inbound messages exist, show the template dialog.
+                                        if (chatType == "whatsapp") {
+                                            val inboundCount = database.chatMessageDao()
+                                                .countInbound(storedNumber, "whatsapp")
+                                            if (inboundCount == 0) {
+                                                showWhatsAppTemplateDialog = true
+                                                return@launch
+                                            }
+                                        }
+
                                         // Build the SIP recipient:
                                         //   WhatsApp → 11 digits (leading 1); sms_send.php keeps it
                                         //   SMS      → 10 digits; sms_send.php forces SMS delivery
@@ -565,6 +578,52 @@ fun MainApp(
             },
             onAttendedTransfer = { target ->
                 sipService?.sipHandler?.attendedTransferStart(target)
+            }
+        )
+    }
+
+    // WhatsApp template dialog — shown when user tries to start a new WhatsApp
+    // conversation with a contact who has never messaged us (Meta error 131047).
+    if (showWhatsAppTemplateDialog) {
+        val TEMPLATE_NAME = "initial_contact"
+        val TEMPLATE_LANG = "en"
+        val TEMPLATE_DISPLAY = "We would like to connect with you. " +
+                "Please reply to this message so we can assist you."
+        AlertDialog(
+            onDismissRequest = { showWhatsAppTemplateDialog = false },
+            title = { Text("WhatsApp — new conversation") },
+            text = {
+                Text(
+                    "${chatNumber ?: "This contact"} has not messaged you on WhatsApp yet.\n\n" +
+                    "Meta will not deliver a free-form message to start a new conversation. " +
+                    "Send the pre-approved template instead?\n\n" +
+                    "The template reads:\n\"$TEMPLATE_DISPLAY\"\n\n" +
+                    "Once they reply you can send any message normally."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showWhatsAppTemplateDialog = false
+                    scope.launch {
+                        val rawNumber = chatNumber ?: return@launch
+                        val storedNumber = normalizeWhatsAppNumber(rawNumber)
+                        val digits = storedNumber.replace(Regex("[^0-9]"), "")
+                        val sipRecipient = if (digits.length == 10) "1$digits" else digits
+                        val templateBody = "__TEMPLATE__:${TEMPLATE_NAME}:${TEMPLATE_LANG}"
+                        val msg = ChatMessage(
+                            remoteNumber = storedNumber,
+                            body = "[Template] $TEMPLATE_DISPLAY",
+                            isOutgoing = true,
+                            status = MessageStatus.SENT,
+                            messageType = "whatsapp"
+                        )
+                        database.chatMessageDao().insert(msg)
+                        sipService?.sipHandler?.sendMessage(sipRecipient, templateBody, "whatsapp")
+                    }
+                }) { Text("Send Template") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showWhatsAppTemplateDialog = false }) { Text("Cancel") }
             }
         )
     }

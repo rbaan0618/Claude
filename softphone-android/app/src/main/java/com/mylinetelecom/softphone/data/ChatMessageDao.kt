@@ -30,6 +30,12 @@ interface ChatMessageDao {
     @Query("SELECT COUNT(*) FROM chat_messages WHERE remoteNumber = :number AND messageType = :type")
     suspend fun countForType(number: String, type: String): Int
 
+    // Count inbound messages from a peer on a given channel.
+    // Used by the WhatsApp template guard: Meta blocks free-form messages to
+    // contacts that have never messaged us — detect this before sending.
+    @Query("SELECT COUNT(*) FROM chat_messages WHERE remoteNumber = :number AND messageType = :type AND isOutgoing = 0")
+    suspend fun countInbound(number: String, type: String): Int
+
     @Insert
     suspend fun insert(message: ChatMessage): Long
 
