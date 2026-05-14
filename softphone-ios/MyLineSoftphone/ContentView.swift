@@ -25,12 +25,17 @@ struct ContentView: View {
             InCallScreen().environmentObject(service)
         }
         .onChange(of: service.callState) { state in
-            if state != .idle {
-                // Any active call state → show the in-call screen
-                showInCall = true
-            } else {
-                // Only dismiss when fully idle (resetCallState fired)
+            switch state {
+            case .incoming:
+                // CallKit native UI handles answer/reject for incoming calls.
+                // Do NOT show InCallScreen here — it would cover the system
+                // call screen and remove the Answer button from view.
+                break
+            case .idle, .disconnected:
                 showInCall = false
+            default:
+                // .calling, .ringing, .confirmed → call is active, show controls
+                showInCall = true
             }
         }
     }
