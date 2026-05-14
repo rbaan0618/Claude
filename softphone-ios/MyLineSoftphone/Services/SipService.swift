@@ -4,6 +4,7 @@ import PushKit
 import AVFoundation
 import Combine
 import UserNotifications
+import Network
 import UIKit
 import os.log
 
@@ -47,6 +48,15 @@ final class SipService: NSObject, ObservableObject {
     // Busy tone played locally when the remote party is busy.
     private var busyPlayer: AVAudioPlayer?
 
+    // Network path monitor — detects WiFi ↔ Cellular transitions and triggers
+    // SIP re-registration before the UDP NAT binding goes stale.
+    private var pathMonitor: NWPathMonitor?
+    private var lastInterfaceType: NWInterface.InterfaceType?
+
+    // When a PushKit push pre-reports an incoming call to CallKit, we store the
+    // UUID here so the subsequent SIP INVITE does NOT create a second CallKit entry.
+    private var pushPrereportedUUID: UUID?
+
     // Silent-audio keepalive removed — see handleAppBackground() comment.
     // Background incoming calls require PushKit (server-side bridge needs deploy).
 
@@ -62,6 +72,8 @@ final class SipService: NSObject, ObservableObject {
 
         pushRegistry.delegate = self
         pushRegistry.desiredPushTypes = [.voIP]
+
+        startNetworkMonitor()
 
         // Bridge SipHandler state changes into CallKit.
         sipHandler.onCallStateChanged = { [weak self] state, number, name in
@@ -156,6 +168,41 @@ final class SipService: NSObject, ObservableObject {
         guard config.isValid else { return }
         Self.log.info("App foregrounded — restarting SIP stack after background loss")
         sipHandler.restartForNetworkChange()
+    }
+
+    /// Monitors network path changes (WiFi ↔ Cellular) and triggers SIP
+    /// re-registration whenever the interface type changes.
+    ///
+    /// iOS calls this handler while the app is:
+    ///  • Foregrounded (always)
+    ///  • In the brief background window before full suspension
+    ///  • Running an active audio call (kept alive by the `audio` background mode)
+    ///
+    /// For fully suspended apps, PushKit is the fallback: the incoming call push
+    /// arrives, `sipHandler.start()` re-registers, and the suspended INVITE resumes.
+    private func startNetworkMonitor() {
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            Task { @MainActor in
+                guard path.status == .satisfied else { return }
+
+                // Identify the dominant interface type.
+                let newType: NWInterface.InterfaceType =
+                    path.usesInterfaceType(.wifi)     ? .wifi     :
+                    path.usesInterfaceType(.cellular) ? .cellular : .other
+
+                if let last = self.lastInterfaceType, last != newType {
+                    Self.log.info(
+                        "Network interface changed \(String(describing: last)) → \(String(describing: newType), privacy: .public) — re-registering"
+                    )
+                    self.sipHandler.restartForNetworkChange()
+                }
+                self.lastInterfaceType = newType
+            }
+        }
+        monitor.start(queue: .global(qos: .utility))
+        pathMonitor = monitor
     }
 
     // MARK: - Outbound calls via CallKit
@@ -345,13 +392,22 @@ final class SipService: NSObject, ObservableObject {
     }
 
     private func reportIncomingCall(number: String, name: String) {
-        let uuid = UUID()
-        activeCallUUID = uuid
-        isOutgoingCall = false
         let update = CXCallUpdate()
         update.remoteHandle = CXHandle(type: .phoneNumber, value: number)
         update.localizedCallerName = name.isEmpty ? number : name
         update.hasVideo = false
+
+        // If PushKit already reported this call to CallKit, just update the caller
+        // info on the existing entry instead of creating a duplicate call UUID.
+        if let existingUUID = pushPrereportedUUID {
+            provider.reportCall(with: existingUUID, updated: update)
+            pushPrereportedUUID = nil   // consumed
+            return
+        }
+
+        let uuid = UUID()
+        activeCallUUID = uuid
+        isOutgoingCall = false
         provider.reportNewIncomingCall(with: uuid, update: update) { error in
             if let error = error {
                 Self.log.error("reportNewIncomingCall failed: \(error.localizedDescription, privacy: .public)")
@@ -459,15 +515,36 @@ extension SipService: PKPushRegistryDelegate {
                                   didReceiveIncomingPushWith payload: PKPushPayload,
                                   for type: PKPushType,
                                   completion: @escaping () -> Void) {
-        // Apple requires us to report an incoming call *before* this completion
-        // handler returns, otherwise the app is terminated.
+        // Apple REQUIRES reportNewIncomingCall to be called synchronously, before
+        // completion() returns. Doing it inside Task {} is not synchronous and can
+        // cause the app to be force-terminated by the system watchdog.
+        let caller     = payload.dictionaryPayload["caller"]     as? String ?? "Unknown"
+        let callerName = payload.dictionaryPayload["callerName"] as? String ?? ""
+
+        let uuid = UUID()
+        let update = CXCallUpdate()
+        update.remoteHandle = CXHandle(type: .phoneNumber, value: caller)
+        update.localizedCallerName = callerName.isEmpty ? caller : callerName
+        update.hasVideo = false
+
+        // Synchronous — must happen before completion() returns.
+        provider.reportNewIncomingCall(with: uuid, update: update) { error in
+            if let error = error {
+                Self.log.error("PushKit reportNewIncomingCall: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        completion()
+
+        // Store UUID and wake the SIP stack on the main actor.
+        // When the SIP INVITE arrives (after re-registration), reportIncomingCall()
+        // will detect this UUID and update the existing CallKit entry instead of
+        // creating a second one.
         Task { @MainActor in
-            let caller = payload.dictionaryPayload["caller"] as? String ?? "Unknown"
-            let callerName = payload.dictionaryPayload["callerName"] as? String ?? ""
-            self.reportIncomingCall(number: caller, name: callerName)
-            // Ensure SIP stack is up so the pending INVITE can be processed.
+            self.activeCallUUID = uuid
+            self.isOutgoingCall = false
+            self.pushPrereportedUUID = uuid
+            // Restart SIP stack — app was suspended, socket is dead.
             self.sipHandler.start()
-            completion()
         }
     }
 }
