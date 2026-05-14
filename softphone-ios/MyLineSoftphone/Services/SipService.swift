@@ -74,6 +74,7 @@ final class SipService: NSObject, ObservableObject {
         pushRegistry.desiredPushTypes = [.voIP]
 
         startNetworkMonitor()
+        startTerminationObserver()
 
         // Bridge SipHandler state changes into CallKit.
         sipHandler.onCallStateChanged = { [weak self] state, number, name in
@@ -203,6 +204,36 @@ final class SipService: NSObject, ObservableObject {
         }
         monitor.start(queue: .global(qos: .utility))
         pathMonitor = monitor
+    }
+
+    /// Registers for `UIApplication.willTerminateNotification` and sends a SIP
+    /// unregister before the process is killed.
+    ///
+    /// This covers the case where the user deliberately force-quits the app.
+    /// After the unregister, dSIPRouter forwards `Expires: 0` to FusionPBX with
+    /// the sbc.myline.tel contact, so FusionPBX stops routing calls to us.
+    ///
+    /// Important: `stopBlocking()` in SipHandler uses `DispatchQueue.main.async`
+    /// for UI callbacks. Blocking the main thread while waiting for ioQueue would
+    /// deadlock. We deliver on a background `OperationQueue` so sleeping there is
+    /// safe, and the main thread stays free to process those async callbacks.
+    private func startTerminationObserver() {
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 1
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willTerminateNotification,
+            object: nil,
+            queue: queue
+        ) { [weak self] _ in
+            guard let self else { return }
+            Self.log.info("App terminating — sending SIP unregister")
+            // stop() dispatches stopBlocking() → unregister() to ioQueue asynchronously.
+            // Sleep 2 s on this background thread to let it complete before the
+            // process is killed. iOS gives ~5 s after willTerminate.
+            self.sipHandler.stop()
+            Thread.sleep(forTimeInterval: 2.0)
+            Self.log.info("Termination unregister window complete")
+        }
     }
 
     // MARK: - Outbound calls via CallKit
