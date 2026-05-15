@@ -75,6 +75,32 @@ struct ChatMessageDao {
         }
     }
 
+    /// Atomically insert an inbound message ONLY if no identical inbound message
+    /// from the same number with the same body exists within `dedupWindow` seconds.
+    ///
+    /// Returns the inserted row id on success, or `nil` if the message was
+    /// suppressed as a duplicate.
+    ///
+    /// This is the correct way to dedupe SIP MESSAGEs because the server can
+    /// retransmit (or fan out via multiple registrations) within milliseconds.
+    /// The previous pattern — `countRecentDuplicates` then `insert` as two
+    /// separate transactions — races: 5 concurrent Tasks all read `count = 0`
+    /// before any of the inserts commits, so all 5 inserts succeed and the
+    /// message shows up 5 times in the UI.
+    @discardableResult
+    func insertIfNotDuplicate(_ message: ChatMessage, dedupWindow seconds: TimeInterval = 5) throws -> Int64? {
+        let since = Date(timeIntervalSinceNow: -seconds)
+        var m = message
+        return try dbQueue.write { db in
+            let count = try Int.fetchOne(db,
+                sql: "SELECT COUNT(*) FROM chat_messages WHERE remoteNumber = ? AND body = ? AND isOutgoing = 0 AND timestamp > ?",
+                arguments: [message.remoteNumber, message.body, since]) ?? 0
+            guard count == 0 else { return nil }
+            try m.insert(db)
+            return m.id
+        }
+    }
+
     // MARK: - Delete
 
     func deleteConversation(remoteNumber: String, messageType: String) throws {

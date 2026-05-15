@@ -1170,10 +1170,41 @@ final class SipHandler: ObservableObject {
         case "BYE":
             let byeResp = buildMirroredResponse(code: 200, reason: "OK", request: message, toTag: "")
             sendSip(byeResp)
+
+            // Identify which dialog this BYE belongs to:
+            //  1) Consultation call → cleanup the consult leg
+            //  2) Primary call by Call-ID match → handleIncomingBye
+            //  3) Primary call by dialog-tag fallback → handleIncomingBye (covers
+            //     edge cases where the proxy rewrote/normalized the Call-ID but
+            //     the From/To tags still identify our dialog uniquely)
+            //
+            // Without (3), a remote-initiated hangup left the iPhone UI showing
+            // "in call" because handleIncomingBye never ran for BYEs whose
+            // Call-ID didn't byte-match currentCallId.
+            // Proper SIP dialog match per RFC 3261 §12: a request is "in dialog"
+            // if BOTH local-tag and remote-tag match (in their correct From/To
+            // positions). For a remote-initiated BYE, From=remote, To=us — so
+            // byeFromTag MUST equal currentRemoteTag AND byeToTag MUST equal
+            // currentLocalTag. Both tags are long random strings, so a double
+            // match is unique enough to identify our dialog even if the Call-ID
+            // got rewritten/normalized somewhere on the proxy path.
+            let byeFromTag = Self.extractTag(message, headerName: "From") ?? ""
+            let byeToTag   = Self.extractTag(message, headerName: "To") ?? ""
+            let dialogMatchesPrimary =
+                callState != .idle &&
+                !currentLocalTag.isEmpty && !currentRemoteTag.isEmpty &&
+                byeFromTag == currentRemoteTag && byeToTag == currentLocalTag
+
             if !consultCallId.isEmpty && msgCallId == consultCallId {
                 cleanupConsultation()
             } else if msgCallId == currentCallId && callState != .idle {
+                Self.log.info("Remote BYE for primary call \(msgCallId, privacy: .public) — ending")
                 handleIncomingBye(message)
+            } else if dialogMatchesPrimary {
+                Self.log.warning("Remote BYE: Call-ID mismatch but dialog tags match — treating as primary-call hangup (msg=\(msgCallId, privacy: .public) cur=\(self.currentCallId, privacy: .public))")
+                handleIncomingBye(message)
+            } else {
+                Self.log.info("Remote BYE ignored: msgCallId=\(msgCallId, privacy: .public) currentCallId=\(self.currentCallId, privacy: .public) state=\(String(describing: self.callState), privacy: .public)")
             }
         case "CANCEL":
             if msgCallId == currentCallId {

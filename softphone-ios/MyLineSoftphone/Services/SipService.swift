@@ -92,6 +92,13 @@ final class SipService: NSObject, ObservableObject {
 
         // Save incoming SIP MESSAGE to DB and show a local notification.
         // Mirrors Android SipService.kt onMessageReceived block.
+        //
+        // Dedup: the server can deliver the same MESSAGE multiple times within
+        // milliseconds (SIP retransmissions, multi-contact fanout, push-flow
+        // double-delivery). Each delivery fires this closure on a fresh Task,
+        // so the dedup MUST be atomic — check-then-insert as two separate
+        // transactions races and lets all 5 copies through. The DAO method
+        // below does both in a single write transaction.
         sipHandler.onMessageReceived = { from, body in
             Task {
                 let msgType = from.hasPrefix("+") ? "whatsapp" : "sms"
@@ -104,16 +111,18 @@ final class SipService: NSObject, ObservableObject {
                     messageType: msgType
                 )
 
-                // Dedup: skip if identical inbound arrived within last 5 seconds.
                 let dao = ChatMessageDao()
-                let since = Date(timeIntervalSinceNow: -5)
-                let dupes = (try? dao.countRecentDuplicates(from: from, body: body, since: since)) ?? 0
-                guard dupes == 0 else {
-                    Self.log.warning("Duplicate inbound message from \(from, privacy: .public) — ignored")
+                let insertedId: Int64?
+                do {
+                    insertedId = try dao.insertIfNotDuplicate(msg, dedupWindow: 5)
+                } catch {
+                    Self.log.error("insertIfNotDuplicate failed: \(error.localizedDescription, privacy: .public)")
                     return
                 }
-
-                _ = try? dao.insert(msg)
+                guard insertedId != nil else {
+                    Self.log.warning("Duplicate inbound message from \(from, privacy: .public) — suppressed")
+                    return
+                }
                 Self.log.info("Saved incoming \(msgType) message from \(from, privacy: .public)")
                 Self.showMessageNotification(from: from, body: body, msgType: msgType)
             }
@@ -282,6 +291,10 @@ final class SipService: NSObject, ObservableObject {
                 provider.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
                 activeCallUUID = nil
             }
+            // A push-prereported call that ended must NOT leave a stale UUID
+            // behind: the next inbound call would route through reportCall(updated:)
+            // on a dead UUID and silently fail to display in CallKit.
+            pushPrereportedUUID = nil
         case .disconnected, .rejected:
             stopRingback()
             stopBusy()
@@ -289,10 +302,12 @@ final class SipService: NSObject, ObservableObject {
                 provider.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
                 activeCallUUID = nil
             }
+            pushPrereportedUUID = nil
         case .idle:
             // SipHandler reset after busy/rejected — stop any lingering tones.
             stopBusy()
             stopRingback()
+            pushPrereportedUUID = nil
         default:
             break
         }
@@ -428,12 +443,24 @@ final class SipService: NSObject, ObservableObject {
         update.localizedCallerName = name.isEmpty ? number : name
         update.hasVideo = false
 
-        // If PushKit already reported this call to CallKit, just update the caller
-        // info on the existing entry instead of creating a duplicate call UUID.
-        if let existingUUID = pushPrereportedUUID {
+        // If PushKit already reported this call to CallKit AND that call is still
+        // the live one (activeCallUUID matches), just update the caller info on
+        // the existing entry instead of creating a duplicate call UUID.
+        //
+        // Safety: if pushPrereportedUUID is stale (the push-reported call was
+        // dismissed/cancelled but the UUID was never cleared), DO NOT use it —
+        // CallKit has no record of that UUID, so reportCall(updated:) silently
+        // does nothing and the new call would never display. Fall through to
+        // reportNewIncomingCall instead.
+        if let existingUUID = pushPrereportedUUID, existingUUID == activeCallUUID {
             provider.reportCall(with: existingUUID, updated: update)
             pushPrereportedUUID = nil   // consumed
             return
+        }
+        if pushPrereportedUUID != nil {
+            // Stale UUID — log and clear so the next branch creates a fresh call.
+            Self.log.warning("Discarding stale pushPrereportedUUID before new INVITE")
+            pushPrereportedUUID = nil
         }
 
         let uuid = UUID()
@@ -453,6 +480,8 @@ extension SipService: CXProviderDelegate {
     nonisolated func providerDidReset(_ provider: CXProvider) {
         Task { @MainActor in
             self.sipHandler.hangup()
+            self.activeCallUUID = nil
+            self.pushPrereportedUUID = nil
         }
     }
 
@@ -482,6 +511,7 @@ extension SipService: CXProviderDelegate {
         Task { @MainActor in
             self.sipHandler.hangup()
             self.activeCallUUID = nil
+            self.pushPrereportedUUID = nil
             action.fulfill()
         }
     }
