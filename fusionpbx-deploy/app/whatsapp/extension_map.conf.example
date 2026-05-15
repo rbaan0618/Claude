@@ -1,0 +1,13 @@
+# Extension -> DID mapping for WhatsApp inbound delivery.
+# Used by webhook.php when the destination DID doesn't have a direct dialplan
+# action pointing at a single extension.
+#
+# Deploy path: /var/www/fusionpbx/app/whatsapp/extension_map.conf
+# Format:      EXTENSION=DID_WITHOUT_PLUS
+#
+# Example: extension 230 should receive inbound WhatsApp messages for the
+# DID +1 (305) 356-1411:
+#
+# 230=13053561411
+#
+# Add one line per mapping.
