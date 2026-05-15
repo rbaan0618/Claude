@@ -431,9 +431,69 @@ If the URL is different (different port, IPv6, etc.), edit either the Python ser
 
 ## Part 6 — dSIPRouter kamailio.cfg push routes
 
-Everything in this section is in `/etc/kamailio/kamailio.cfg` on the SBC. These routes implement the suspend-and-push-resume pattern.
+Everything in this section is on the dSIPRouter SBC: SQL on the MariaDB `kamailio` database, plus changes to `/etc/kamailio/kamailio.cfg`. These routes implement the suspend-and-push-resume pattern.
 
 > **Detailed source for every block** — see [`myline-platform-deployment-guide.md`](myline-platform-deployment-guide.md) §7. This iOS guide gives a brief overview to help you locate each piece.
+
+### Step 6.0 — All database changes for iOS push (run this first)
+
+**Single SQL block** to apply on a fresh dSIPRouter — adds only ONE new table (`dsip_push_tokens`). All other state for push lives in in-memory htables defined in `kamailio.cfg`.
+
+```bash
+mysql -u root kamailio <<'SQL'
+
+-- ─── Table: dsip_push_tokens ──────────────────────────────────────────
+-- Stores the iPhone's APNs device token, keyed by SIP AOR (USER@DOMAIN).
+-- Populated by the REGISTER handler when it sees a Contact with ;pn-prid=
+-- Read by route[SENDPUSH] to look up the token before POSTing to the
+-- Python push server (/opt/myline/voip_push_server.py on port 8070).
+-- DB-backed so tokens survive kamailio restart.
+CREATE TABLE IF NOT EXISTS dsip_push_tokens (
+    account     VARCHAR(128) NOT NULL,
+    push_token  VARCHAR(512) NOT NULL,
+    updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (account)
+);
+
+SQL
+```
+
+**No other tables need to be created or altered for iOS push.** Specifically:
+
+| Table | Status | Why |
+|-------|--------|-----|
+| `dsip_push_tokens` | **CREATE** (above) | New — DB-backed storage for push tokens |
+| `location` | NO change | Standard Kamailio usrloc — already exists. We only do `DELETE FROM location WHERE username=...` in the REGISTER handler at runtime (no schema change). |
+| `dsip_maintmode`, `dsip_lcr`, `dsip_call_settings_h`, etc. | NO change | dSIPRouter-managed, pre-existing |
+| `domain`, `subscriber`, `address` | NO change | Pre-existing, multi-tenant routing |
+
+**`/etc/kamailio/kamailio.cfg` htable definitions** (in-memory state — no SQL, just config). Add these next to the other `modparam("htable", ...)` lines around line ~940:
+
+```cfg
+# ── Push token storage ──────────────────────────────────────────────
+# DB-backed via dsip_push_tokens so tokens survive restart.
+# autoexpire=86400 (24h) matches our REGISTER forwarding window.
+modparam("htable", "htable",
+    "pushtok=>size=8;autoexpire=86400;dbtable=dsip_push_tokens;cols='account,push_token';")
+
+# ── Suspended-INVITE join keys ──────────────────────────────────────
+# Stores transaction ID per pending INVITE (key = "join::USER@DOMAIN").
+# In-memory only — transient, lifetime of one ringing INVITE.
+modparam("htable", "htable",
+    "push=>size=10;autoexpire=120;")
+```
+
+The `pass_thru_auth` htable (used by all push routes to recover the registrar domain when an INVITE arrives from FusionPBX with a different To-domain) is pre-existing in stock dSIPRouter — no change needed:
+```cfg
+# Pre-existing in dSIPRouter — referenced here only for clarity, do not duplicate.
+modparam("htable", "htable",
+    "pass_thru_auth=>size=8;autoexpire=3600;dmqreplicate=DMQ_REPLICATE_ENABLED;")
+```
+
+**That's it for DB modifications for iOS push.** Everything else in Part 6 below is config-only changes to routes in `kamailio.cfg`.
+
+---
 
 ### Step 6.1 — REGISTER handler: extract pn-prid + Contact rewrite
 
@@ -455,24 +515,7 @@ remove_hf("Expires");
 append_hf("Expires: 86400\r\n");
 ```
 
-### Step 6.2 — `dsip_push_tokens` table
-
-```sql
-CREATE TABLE IF NOT EXISTS dsip_push_tokens (
-    account     VARCHAR(128) NOT NULL,
-    push_token  VARCHAR(512) NOT NULL,
-    updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-                ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (account)
-);
-```
-
-And the corresponding kamailio htable modparam (around line 944):
-```cfg
-modparam("htable", "htable", "pushtok=>size=8;autoexpire=86400;dbtable=dsip_push_tokens;cols='account,push_token';")
-```
-
-### Step 6.3 — `route[SENDPUSH]`
+### Step 6.2 — `route[SENDPUSH]`
 
 ```cfg
 route[SENDPUSH] {
@@ -498,7 +541,7 @@ route[PUSH_CB] {
 
 `PUSH_SECRET` here MUST equal `PUSH_SECRET` in `/opt/myline/voip_push_server.py`.
 
-### Step 6.4 — `route[SUSPEND]`
+### Step 6.3 — `route[SUSPEND]`
 
 Stores the in-flight INVITE transaction ID in an htable so a future REGISTER (triggered by the push wakeup) can resume it.
 
@@ -510,7 +553,7 @@ route[SUSPEND] {
 }
 ```
 
-### Step 6.5 — `failure_route[PUSH_FAIL]`
+### Step 6.4 — `failure_route[PUSH_FAIL]`
 
 Fires if the INVITE was sent (NAT alive) but device didn't respond in 5 sec — assume suspended, send push and re-suspend.
 
@@ -525,7 +568,7 @@ failure_route[PUSH_FAIL] {
 }
 ```
 
-### Step 6.6 — `route[RESUME]` and `route[JOIN]`
+### Step 6.5 — `route[RESUME]` and `route[JOIN]`
 
 When the iPhone re-registers post-push, REGISTER handler fires `route(JOIN)` which calls `t_continue()` to resume the original INVITE in `route[RESUME]`. RESUME does the location lookup and relays the INVITE to the now-alive iPhone.
 
@@ -562,7 +605,7 @@ if ($sht(push=>join::$tU@$td) != $null) {
 #!endif
 ```
 
-### Step 6.7 — Strip `pn-*` URI parameters before relaying INVITE to iPhone
+### Step 6.6 — Strip `pn-*` URI parameters before relaying INVITE to iPhone
 
 The iPhone's SIP library silently rejects INVITEs whose Request-URI contains non-standard URI params. Strip them in `route[LOCATION]` for push-capable devices:
 
@@ -577,7 +620,7 @@ if (is_method("INVITE") && ($ru =~ "pn-prid=")) {
 }
 ```
 
-### Step 6.8 — In-dialog BYE relay (iOS hangup quirk fix)
+### Step 6.7 — In-dialog BYE relay (iOS hangup quirk fix)
 
 iPhone's SIP library doesn't always include a Route header on BYE. Without this fix, dSIPRouter returns `481 Call/Transaction Does Not Exist` and the BYE never reaches FusionPBX → other party stays connected.
 
@@ -591,7 +634,7 @@ if (has_totag() && is_method("BYE|UPDATE|INVITE|PRACK")) {
 }
 ```
 
-### Step 6.9 — Sanity check: don't require Content-Length
+### Step 6.8 — Sanity check: don't require Content-Length
 
 iPhone SIP library doesn't always include `Content-Length` on UDP. Default `sanity_check("1511","7")` rejects them. Change to `1479` (= 1511 - 32):
 
@@ -602,7 +645,7 @@ if (!sanity_check("1479", "7")) {
 }
 ```
 
-### Step 6.10 — Aggressive NAT keepalive (every 20s)
+### Step 6.9 — Aggressive NAT keepalive (every 20s)
 
 ```cfg
 modparam("nathelper", "natping_interval", 20)
@@ -613,7 +656,7 @@ modparam("nathelper", "sipping_from", "sip:pinger@UAC_REG_ADDR")
 
 20 sec gives margin against typical 30 sec NAT UDP binding timeouts. Combined with the iPhone's own 15 sec OPTIONS, NAT stays open even when the app is briefly backgrounded.
 
-### Step 6.11 — Validate kamailio config and reload
+### Step 6.10 — Validate kamailio config and reload
 
 After applying ALL of Part 6:
 
