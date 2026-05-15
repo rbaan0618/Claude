@@ -8,7 +8,7 @@
 This guide covers everything WhatsApp-specific:
 
 - Part 1 — Meta Business Manager account setup and phone-number registration
-- Part 2 — FusionPBX `app/whatsapp/` PHP module (custom code in this repo)
+- Part 2 — FusionPBX `app/whatsapp/` PHP module **and the nginx location block** (custom code in this repo)
 - Part 3 — FusionPBX SMS bridge that forks WhatsApp messages to the module
 - Part 4 — dSIPRouter SBC configuration for WhatsApp **voice** calls
 - Part 5 — Per-tenant onboarding checklist
@@ -253,7 +253,57 @@ $default_phone_id = '1234567890123456';
 >
 > **Future improvement:** extract the `$clients` array into `/etc/myline/whatsapp_clients.php` and `require` it from both files.
 
-### 2.4 — Verify webhook is reachable from Meta
+### 2.4 — Add the nginx location block for the webhook
+
+The webhook endpoint at `/app/whatsapp/webhook.php` is NOT served by FusionPBX's default nginx rewrite rules — those route every URL through the FusionPBX `index.php` front controller, which would never run our `webhook.php`. You must add a dedicated `location` block that routes `/app/whatsapp/` directly to PHP-FPM.
+
+Source: [`fusionpbx-deploy/nginx/whatsapp-webhook.conf`](../fusionpbx-deploy/nginx/whatsapp-webhook.conf)
+
+Edit `/etc/nginx/sites-available/fusionpbx` (which is symlinked from `sites-enabled/`). Find the **HTTPS server block** (`server { listen 443; ... }`) and add this INSIDE it, after `server_name` and before the catch-all `location /` block:
+
+```nginx
+#whatsapp webhook
+location /app/whatsapp/ {
+    alias /var/www/fusionpbx/app/whatsapp/;
+    index webhook.php;
+    location ~ \.php$ {
+        fastcgi_pass unix:/var/run/php/php-fpm.sock;
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $request_filename;
+    }
+}
+```
+
+**What each line does:**
+
+| Directive | Purpose |
+|-----------|---------|
+| `location /app/whatsapp/` | Catch all requests under `/app/whatsapp/` |
+| `alias /var/www/fusionpbx/app/whatsapp/` | Map URL → filesystem path (so `/app/whatsapp/webhook.php` reads `/var/www/fusionpbx/app/whatsapp/webhook.php`) |
+| `index webhook.php` | If URL is `/app/whatsapp/` (no file specified), default to `webhook.php` |
+| `location ~ \.php$` | Nested location: any `.php` file under here goes to PHP-FPM via fastcgi |
+| `fastcgi_pass unix:/var/run/php/php-fpm.sock` | The PHP-FPM Unix socket (path may differ on your distro — check `find /var/run -name 'php*.sock'`) |
+| `fastcgi_param SCRIPT_FILENAME $request_filename` | Tell PHP-FPM the actual filesystem path (uses the alias above) |
+
+**Note on PHP-FPM socket path:** the snippet uses `/var/run/php/php-fpm.sock`. On some Debian/Ubuntu installs it's versioned, e.g. `/var/run/php/php8.2-fpm.sock` or `/run/php/php-fpm.sock`. Find yours:
+
+```bash
+ls /var/run/php/*.sock 2>/dev/null || find /var/run -name '*fpm*.sock'
+```
+
+Then update `fastcgi_pass` accordingly.
+
+**Validate and reload:**
+
+```bash
+nginx -t       # syntax check
+systemctl reload nginx
+```
+
+If `nginx -t` complains, look for misplaced `}` or a missing `;` after `}` of the location block.
+
+### 2.5 — Verify webhook is reachable from Meta
 
 ```bash
 # From your laptop:
@@ -262,11 +312,13 @@ curl -v "https://<fusionpbx-host>/app/whatsapp/webhook.php?hub_mode=subscribe&hu
 
 Expected response: `200 OK` with body `test123`. If you see:
 
-- `403 Forbidden` → verify token mismatch
-- `404 Not Found` → file not at expected path, or Apache rewrites blocking it
-- `500 Internal Server Error` → check `/var/log/apache2/error.log` and `/var/log/whatsapp_webhook.log`
+- `403 Forbidden` → verify token mismatch (check `$verify_token` in `webhook.php`)
+- `404 Not Found` → nginx location block missing or wrong (re-do §2.4)
+- `502 Bad Gateway` → wrong PHP-FPM socket path in `fastcgi_pass` (see note above)
+- `500 Internal Server Error` → check `/var/log/nginx/error.log` and `/var/log/whatsapp_webhook.log`
+- HTML response (FusionPBX login page) → location block was added but in the wrong server block, OR nginx fell through to the catch-all (location precedence problem — make sure `location /app/whatsapp/` is in the same server block as your default FusionPBX serving)
 
-### 2.5 — Test `send.php` from CLI
+### 2.6 — Test `send.php` from CLI
 
 Before any softphone integration, send a manual message:
 
@@ -663,6 +715,7 @@ Source files in this repo → target paths on production servers:
 | `fusionpbx-deploy/app/whatsapp/extension_map.conf.example` | `/var/www/fusionpbx/app/whatsapp/extension_map.conf` | www-data | 644 |
 | `fusionpbx-deploy/app/sms/index.lua` | `/usr/share/freeswitch/scripts/app/sms/index.lua` | www-data | 644 |
 | `sms_send.php` (repo root) | `/usr/share/freeswitch/scripts/app/sms/send.php` | www-data | 644 |
+| `fusionpbx-deploy/nginx/whatsapp-webhook.conf` | merge into `/etc/nginx/sites-available/fusionpbx` (HTTPS server block) | root | 644 |
 
 Database changes (dSIPRouter MariaDB):
 
