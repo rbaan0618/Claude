@@ -1023,16 +1023,16 @@ systemctl status kamailio
 1. https://developer.apple.com/account/resources/authkeys/list
 2. **+** → **Apple Push Notifications service (APNs)**
 3. Download the `.p8` file (one-time download — save it)
-4. Note the **Key ID** (10 chars, e.g. `S9YL3CA54S`)
+4. Note the **Key ID** (10 chars, e.g. `ABCD1234XY`)
 5. Note your **Team ID** (top-right of dev portal)
 
 ### Step 8.2 — Deploy the push files on dSIPRouter
 
 ```bash
 mkdir -p /etc/myline
-cp AuthKey_S9YL3CA54S.p8 /etc/myline/
-chown www-data:www-data /etc/myline/AuthKey_S9YL3CA54S.p8
-chmod 600 /etc/myline/AuthKey_S9YL3CA54S.p8
+cp AuthKey_ABCD1234XY.p8 /etc/myline/
+chown www-data:www-data /etc/myline/AuthKey_ABCD1234XY.p8
+chmod 600 /etc/myline/AuthKey_ABCD1234XY.p8
 ```
 
 Deploy the PHP bridge (the file `voip_push_bridge.php` in this repo):

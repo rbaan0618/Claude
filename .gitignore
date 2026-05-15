@@ -1,0 +1,63 @@
+# =====================================================================
+# .gitignore for the My Line Telecom monorepo
+# =====================================================================
+
+# ---- Files containing live production credentials ----
+# These root-level files are deployed manually to servers and contain
+# real Apple Key IDs, APNs Team IDs, push secrets, and Meta tokens.
+# Never commit them — sanitized versions live in dsiprouter-deploy/
+# and fusionpbx-deploy/ instead.
+voip_push_bridge.php
+freeswitch_push.lua
+
+# ---- Build artifacts ----
+*.apk
+*.apk.idsig
+*.ipa
+
+# Android
+softphone-android/.gradle/
+softphone-android/.idea/
+softphone-android/.kotlin/
+softphone-android/app/.cxx/
+softphone-android/app/build/
+softphone-android/local.properties
+softphone-android/captures/
+softphone-android/.externalNativeBuild/
+
+# Python (Windows softphone)
+softphone/build/
+softphone/dist/
+softphone/__pycache__/
+softphone/**/__pycache__/
+softphone/**/*.pyc
+
+# iOS / Xcode
+softphone-ios/build/
+softphone-ios/DerivedData/
+softphone-ios/*.xcworkspace/xcuserdata/
+softphone-ios/*.xcodeproj/xcuserdata/
+softphone-ios/*.xcodeproj/project.xcworkspace/xcuserdata/
+softphone-ios/Pods/
+
+# ---- Local-only / sync tools ----
+.stignore
+.stfolder*
+
+# ---- Editor / OS noise ----
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# ---- Secrets that should never appear ----
+*.p8
+*.p12
+*.mobileprovision
+*.cer
+*.pem
+.env
+.env.*
+!.env.example

@@ -1,0 +1,14 @@
+[Unit]
+Description=MyLine VoIP Push Server
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/myline/voip_push_server.py
+Restart=always
+RestartSec=5
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
