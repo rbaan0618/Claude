@@ -631,8 +631,15 @@ extension SipService: PKPushRegistryDelegate {
 
 extension SipService {
     static func requestNotificationPermission() {
-        UNUserNotificationCenter.current()
-            .requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+        let center = UNUserNotificationCenter.current()
+        // Install our delegate BEFORE requesting authorization so the very
+        // first authorized notification — which may fire while the app is
+        // still in the foreground (the user is on the chat screen when the
+        // SMS/WhatsApp arrives) — gets `willPresent` and is shown as a
+        // banner.  Without a delegate, iOS suppresses foreground
+        // notifications silently and the user sees nothing.
+        center.delegate = SipService.shared
+        center.requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
     }
 
     static func showMessageNotification(from: String, body: String, msgType: String) {
@@ -648,5 +655,25 @@ extension SipService {
             trigger: nil
         )
         UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
+    }
+}
+
+// MARK: - UNUserNotificationCenterDelegate (foreground banner)
+
+extension SipService: UNUserNotificationCenterDelegate {
+    /// Called when a local notification fires while the app is in the
+    /// foreground.  Without overriding this, iOS suppresses the banner and
+    /// the user has no visible/audible indication that an SMS or WhatsApp
+    /// message has arrived while they have the app open.
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        if #available(iOS 14.0, *) {
+            completionHandler([.banner, .list, .sound])
+        } else {
+            completionHandler([.alert, .sound])
+        }
     }
 }
