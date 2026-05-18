@@ -1663,7 +1663,15 @@ final class SipHandler: ObservableObject {
     }
 
     private func buildMirroredResponse(code: Int, reason: String, request: String, toTag: String) -> String {
-        let via = Self.extractHeader(request, name: "Via") ?? ""
+        // Echo ALL Via headers from the request, in order — required by RFC 3261
+        // §17.2.1.  When a proxy chain forwards a request, each hop adds its own
+        // Via on top; the response MUST contain every Via from the request so
+        // each proxy can pop its own and forward upstream.  Previously we only
+        // echoed the top Via, which caused FusionPBX to never see our 200 OK
+        // for MESSAGE/BYE and retransmit indefinitely (each retransmit re-fires
+        // the iOS message receive path, producing duplicate chat entries).
+        let vias = Self.extractAllHeaders(request, name: "Via")
+        let viaLines = vias.map { "Via: \($0)\r\n" }.joined()
         let from = Self.extractHeader(request, name: "From") ?? ""
         let to = Self.extractHeader(request, name: "To") ?? ""
         let callId = Self.extractHeader(request, name: "Call-ID") ?? ""
@@ -1671,7 +1679,7 @@ final class SipHandler: ObservableObject {
         let toWithTag = (!toTag.isEmpty && !to.contains("tag=")) ? "\(to);tag=\(toTag)" : to
         return
             "SIP/2.0 \(code) \(reason)\r\n" +
-            "Via: \(via)\r\n" +
+            viaLines +
             "From: \(from)\r\n" +
             "To: \(toWithTag)\r\n" +
             "Call-ID: \(callId)\r\n" +
@@ -2071,6 +2079,23 @@ final class SipHandler: ObservableObject {
             }
         }
         return nil
+    }
+
+    /// Returns ALL occurrences of a header (in order), one entry per line.
+    /// Required for Via — a SIP response must echo every Via header from
+    /// the request in the same order, otherwise upstream proxies cannot
+    /// route the response back along the request path and they retransmit
+    /// the request indefinitely.
+    static func extractAllHeaders(_ message: String, name: String) -> [String] {
+        let prefix = name.lowercased() + ":"
+        var values: [String] = []
+        for raw in message.split(separator: "\r\n") {
+            let line = String(raw)
+            if line.lowercased().hasPrefix(prefix) {
+                values.append(String(line.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces))
+            }
+        }
+        return values
     }
 
     static func extractTag(_ message: String, headerName: String) -> String? {

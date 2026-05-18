@@ -114,7 +114,24 @@ final class SipService: NSObject, ObservableObject {
                 let dao = ChatMessageDao()
                 let insertedId: Int64?
                 do {
-                    insertedId = try dao.insertIfNotDuplicate(msg, dedupWindow: 5)
+                    // Dedup window: 300 seconds (5 min).
+                    //
+                    // Why 5 minutes rather than the original 5 seconds:
+                    // The SBC/FusionPBX may retransmit a SIP MESSAGE many
+                    // times when it doesn't see our 200 OK (e.g. due to
+                    // multi-Via responses, transient packet loss, or
+                    // FusionPBX's message_queue service re-polling).
+                    // Retransmits we observed were spaced 8-20+ seconds
+                    // apart, easily exceeding the original 5-sec window
+                    // and creating duplicate chat entries.
+                    //
+                    // 5 minutes is well past the longest reasonable SIP
+                    // transaction timeout (T1*64 = 32 sec for INVITE,
+                    // ~32 sec for non-INVITE) and any plausible upstream
+                    // re-send loop. Legitimate duplicate user-sent messages
+                    // with identical body are rare enough to be acceptable
+                    // collateral.
+                    insertedId = try dao.insertIfNotDuplicate(msg, dedupWindow: 300)
                 } catch {
                     Self.log.error("insertIfNotDuplicate failed: \(error.localizedDescription, privacy: .public)")
                     return
