@@ -95,6 +95,12 @@ final class SipHandler: ObservableObject {
     private var currentLocalTag: String = ""
     private var currentRemoteTag: String = ""
     private var currentRemoteUri: String = ""
+    /// Dialog route set per RFC 3261 §12.1.2.  Reversed Record-Route from the
+    /// 2xx response (UAC) or the INVITE (UAS).  Used as Route headers on
+    /// in-dialog requests (ACK to 2xx, BYE, re-INVITE) so that the request is
+    /// loose-routed back through every proxy in the original signalling path.
+    /// Empty until the dialog is established.
+    private var currentRouteSet: [String] = []
     private var currentCallDirection: String = "" // "inbound" / "outbound"
     private var currentCSeq: Int = 1
     private var currentInviteBranch: String = ""
@@ -372,6 +378,12 @@ final class SipHandler: ObservableObject {
                 }
             default:
                 self.currentCSeq += 1
+                // In-dialog BYE must walk the dialog's route set (RFC 3261
+                // §12.2.1.1) so every proxy that touched the INVITE also
+                // sees the BYE.  Otherwise the far end never tears the call
+                // down and continues to bill / hold resources.
+                var headers: [(String, String)] = []
+                for r in self.currentRouteSet { headers.append(("Route", r)) }
                 let req = self.buildRequest(
                     method: "BYE",
                     requestUri: self.currentRemoteUri,
@@ -381,7 +393,7 @@ final class SipHandler: ObservableObject {
                     cseq: self.currentCSeq,
                     fromTag: self.currentLocalTag,
                     toTag: self.currentRemoteTag,
-                    extraHeaders: [],
+                    extraHeaders: headers,
                     body: "",
                     viaBranch: nil
                 )
@@ -957,6 +969,20 @@ final class SipHandler: ObservableObject {
             }
         case 200:
             currentRemoteTag = Self.extractTag(message, headerName: "To") ?? currentRemoteTag
+            // RFC 3261 §12.1.2 — establish the dialog's route set and remote
+            // target from the 2xx response.  Without this the ACK (and any
+            // subsequent BYE / re-INVITE) targets the AOR instead of the
+            // callee's Contact and carries no Route header, so proxies cannot
+            // forward it.  FusionPBX/FreeSWITCH then never sees a matching
+            // ACK and retransmits 200 OK indefinitely while the iPhone UI
+            // appears stuck on the dial screen.
+            let contactHeader = Self.extractHeader(message, name: "Contact") ?? ""
+            if let match = contactHeader.range(of: #"<(sip:[^>]+)>"#, options: .regularExpression) {
+                let full = String(contactHeader[match])
+                currentRemoteUri = String(full.dropFirst().dropLast())
+            }
+            let rrHeaders = Self.extractAllHeaders(message, name: "Record-Route")
+            currentRouteSet = Array(rrHeaders.reversed())
             parseSdp(message)
             sendAck(responseMessage: message, isNon2xx: false)
             inviteAuthAttempted = false
@@ -1246,6 +1272,11 @@ final class SipHandler: ObservableObject {
         } else {
             currentRemoteUri = "sip:\(number)@\(config.domain)"
         }
+        // UAS dialog route set is the Record-Route from the INVITE in
+        // FORWARD order (RFC 3261 §12.1.1).  Needed so any BYE we send
+        // walks back through the same proxy chain.
+        let rrHeaders = Self.extractAllHeaders(message, name: "Record-Route")
+        currentRouteSet = rrHeaders
 
         parseSdp(message)
         localRtpPort = allocateRtpPort()
@@ -1559,6 +1590,14 @@ final class SipHandler: ObservableObject {
         let remoteTag = Self.tagInHeaderValue(toHeader) ?? currentRemoteTag
         let requestUri = currentRemoteUri.isEmpty ? "sip:\(config.domain)" : currentRemoteUri
         let branch = isNon2xx ? (Self.extractViaBranch(responseMessage) ?? "") : nil
+        // ACK to 2xx is a fresh transaction *within* the dialog, so it MUST
+        // carry Route headers built from the route set (RFC 3261 §13.2.2.4).
+        // ACK to non-2xx is part of the original INVITE transaction and is
+        // sent hop-by-hop with the same Via branch — no Route headers.
+        var headers: [(String, String)] = []
+        if !isNon2xx {
+            for r in currentRouteSet { headers.append(("Route", r)) }
+        }
         let req = buildRequest(
             method: "ACK",
             requestUri: requestUri,
@@ -1568,7 +1607,7 @@ final class SipHandler: ObservableObject {
             cseq: currentCSeq,
             fromTag: currentLocalTag,
             toTag: remoteTag,
-            extraHeaders: [],
+            extraHeaders: headers,
             body: "",
             viaBranch: branch
         )
@@ -1956,6 +1995,7 @@ final class SipHandler: ObservableObject {
         currentLocalTag = ""
         currentRemoteTag = ""
         currentRemoteUri = ""
+        currentRouteSet = []
         currentCallDirection = ""
         currentCSeq = 1
         currentInviteBranch = ""
