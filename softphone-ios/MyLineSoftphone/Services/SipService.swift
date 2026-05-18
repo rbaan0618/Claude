@@ -32,6 +32,19 @@ final class SipService: NSObject, ObservableObject {
     @Published private(set) var callState: CallState = .idle
     @Published private(set) var registrationState: RegistrationState = .unregistered
 
+    /// In-app toast shown when an incoming SMS / WhatsApp message arrives.
+    /// Set to `nil` after a few seconds so the banner auto-dismisses.
+    /// This is independent of `UNUserNotificationCenter` so the user still
+    /// sees feedback even when they have denied notification permission
+    /// or iOS is suppressing foreground banners.
+    struct IncomingMessageToast: Equatable, Identifiable {
+        let id = UUID()
+        let from: String
+        let body: String
+        let isWhatsApp: Bool
+    }
+    @Published var incomingMessageToast: IncomingMessageToast?
+
     // CallKit
     private let provider: CXProvider
     private let callController = CXCallController()
@@ -142,6 +155,23 @@ final class SipService: NSObject, ObservableObject {
                 }
                 Self.log.info("Saved incoming \(msgType) message from \(from, privacy: .public)")
                 Self.showMessageNotification(from: from, body: body, msgType: msgType)
+                // Always publish an in-app toast — independent of iOS
+                // notification permission — so the user sees an alert
+                // even when the app is in the foreground or the user
+                // has disabled banners for the app.
+                await MainActor.run {
+                    let toast = IncomingMessageToast(
+                        from: from, body: body, isWhatsApp: msgType == "whatsapp"
+                    )
+                    SipService.shared.incomingMessageToast = toast
+                    // Auto-dismiss after 4 s unless replaced by a newer toast.
+                    let toastId = toast.id
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                        if SipService.shared.incomingMessageToast?.id == toastId {
+                            SipService.shared.incomingMessageToast = nil
+                        }
+                    }
+                }
             }
         }
     }
@@ -338,13 +368,24 @@ final class SipService: NSObject, ObservableObject {
         guard ringbackPlayer == nil else { return }
         let wav = buildRingbackWav()
         do {
-            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: .mixWithOthers)
-            try AVAudioSession.sharedInstance().setActive(true)
+            // .playAndRecord + .voiceChat matches what CallKit / RtpSession use
+            // once the call connects, so we don't fight CallKit for the session
+            // partway through.  .mixWithOthers + .defaultToSpeaker keep the
+            // ringback audible on the loudspeaker even when CallKit has staged
+            // an outbound call (without this iOS sometimes silences the route
+            // until the call actually answers).
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playAndRecord,
+                                    mode: .voiceChat,
+                                    options: [.mixWithOthers, .defaultToSpeaker, .allowBluetooth])
+            try session.setActive(true, options: [])
             let player = try AVAudioPlayer(data: wav, fileTypeHint: AVFileType.wav.rawValue)
             player.numberOfLoops = -1   // loop until stopped
-            player.volume = 0.7
+            player.volume = 1.0
+            player.prepareToPlay()
             player.play()
             ringbackPlayer = player
+            Self.log.info("Ringback started — playing=\(player.isPlaying)")
         } catch {
             Self.log.warning("Ringback start failed: \(error.localizedDescription, privacy: .public)")
         }

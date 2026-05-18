@@ -25,6 +25,12 @@ struct DialpadScreen: View {
                         let item = rows[r][c]
                         DialpadButton(digit: item.0, letters: item.1) {
                             number.append(item.0)
+                            // Audible DTMF feedback so the dial-pad feels
+                            // like a real phone.  Plays the appropriate
+                            // 697/770/852/941 × 1209/1336/1477 Hz pair.
+                            if let ch = item.0.first {
+                                DtmfPlayer.shared.play(ch)
+                            }
                         }
                     }
                 }

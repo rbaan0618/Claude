@@ -24,6 +24,15 @@ struct ContentView: View {
         .fullScreenCover(isPresented: $showInCall) {
             InCallScreen().environmentObject(service)
         }
+        .overlay(alignment: .top) {
+            if let toast = service.incomingMessageToast {
+                IncomingMessageToastView(toast: toast)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: service.incomingMessageToast?.id)
         .onChange(of: service.callState) { state in
             switch state {
             case .incoming:
@@ -38,5 +47,42 @@ struct ContentView: View {
                 showInCall = true
             }
         }
+    }
+}
+
+/// Slim banner shown at the top of the app when a new SMS / WhatsApp
+/// message arrives.  Independent of iOS notification permissions —
+/// always appears in-app for foreground feedback.
+private struct IncomingMessageToastView: View {
+    let toast: SipService.IncomingMessageToast
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: toast.isWhatsApp ? "bubble.left.and.bubble.right.fill"
+                                                : "message.fill")
+                .font(.system(size: 22))
+                .foregroundColor(.white)
+                .frame(width: 36, height: 36)
+                .background(toast.isWhatsApp ? Color.green : Color.blue)
+                .clipShape(Circle())
+            VStack(alignment: .leading, spacing: 2) {
+                Text(toast.isWhatsApp ? "WhatsApp · \(toast.from)"
+                                       : "SMS · \(toast.from)")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(.primary)
+                Text(toast.body)
+                    .font(.system(size: 13))
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 10)
+        .padding(.horizontal, 14)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .fill(.thickMaterial)
+                .shadow(color: Color.black.opacity(0.15), radius: 8, y: 2)
+        )
     }
 }
