@@ -1686,17 +1686,28 @@ final class SipHandler: ObservableObject {
         let ip = publicIp.isEmpty ? localIp : publicIp
         let sessionId = Int(Date().timeIntervalSince1970)
         let mode = holdMode ? "a=sendonly" : "a=sendrecv"
+        // Codec offer policy — PCMU only.
+        //
+        // We previously offered PCMU + G.729 + GSM, but if FreeSWITCH negotiated
+        // G.729 with the far carrier the iPhone received G.729 inbound while its
+        // BCG729 decoder failed to open() — symptom: caller hears us but we hear
+        // silence (the receive loop skips packets it can't decode).  GSM is pure
+        // Swift so works, but isn't universally accepted by US carriers, leaving
+        // an awkward middle ground.
+        //
+        // Offering only PCMU (payload type 0) forces every leg to use PCMU.
+        // PCMU = G.711 µ-law, 64 kbit/s, the universal voice codec. Audio
+        // quality is identical to PSTN. Bandwidth is 8x G.729 but trivial
+        // on any modern network.  101 is telephone-event (DTMF) — required for
+        // any voice mail / IVR / carrier services that need keypad input.
         return
             "v=0\r\n" +
             "o=\(config.username) \(sessionId) \(sessionId) IN IP4 \(ip)\r\n" +
             "s=MyLineTelecom\r\n" +
             "c=IN IP4 \(ip)\r\n" +
             "t=0 0\r\n" +
-            "m=audio \(rtpPort) RTP/AVP 0 18 3 101\r\n" +
+            "m=audio \(rtpPort) RTP/AVP 0 101\r\n" +
             "a=rtpmap:0 PCMU/8000\r\n" +
-            "a=rtpmap:18 G729/8000\r\n" +
-            "a=fmtp:18 annexb=no\r\n" +
-            "a=rtpmap:3 GSM/8000\r\n" +
             "a=rtpmap:101 telephone-event/8000\r\n" +
             "a=fmtp:101 0-16\r\n" +
             "a=ptime:20\r\n" +
