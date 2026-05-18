@@ -160,6 +160,15 @@ final class SipHandler: ObservableObject {
     private var stopping = false
     private var restarting = false
 
+    /// Watchdog timer that fires if the call is stuck in a transient state
+    /// (.incoming, .calling, .ringing) for too long without progressing to
+    /// .confirmed / .disconnected.  This recovers from cases where the
+    /// caller's CANCEL was lost in transit (e.g. NAT mapping churned during
+    /// PushKit wake-up) and the iPhone's CallKit UI would otherwise ring
+    /// forever, leaving callState stuck so that every subsequent INVITE
+    /// gets rejected with 486 Busy Here.
+    private var stuckStateWatchdog: DispatchSourceTimer?
+
     // MARK: - VoIP push token
 
     /// Hex push token supplied by PushKit. Included as X-Push-Token in every
@@ -1235,6 +1244,25 @@ final class SipHandler: ObservableObject {
         case "CANCEL":
             if msgCallId == currentCallId {
                 handleIncomingCancel(message)
+            } else {
+                // CANCEL is matched by Call-ID alone per RFC 3261 §9.2 — there
+                // is no To-tag yet on the early dialog.  If the Call-ID got
+                // rewritten somewhere on the proxy path the cancel is silently
+                // dropped, leaving CallKit ringing forever.  Fall back to a
+                // dialog-tag match (From-tag must equal the remote tag from
+                // the INVITE) so we still tear down the call without waiting
+                // for the watchdog timer.  Only honour this for .incoming /
+                // .ringing — a confirmed call is safer to leave alone.
+                let cancelFromTag = Self.extractTag(message, headerName: "From") ?? ""
+                let tagsMatch = !cancelFromTag.isEmpty
+                    && !currentRemoteTag.isEmpty
+                    && cancelFromTag == currentRemoteTag
+                if tagsMatch && (callState == .incoming || callState == .ringing) {
+                    Self.log.warning("CANCEL Call-ID mismatched but From-tag matches dialog — treating as remote cancel (msg=\(msgCallId, privacy: .public) cur=\(self.currentCallId, privacy: .public))")
+                    handleIncomingCancel(message)
+                } else {
+                    Self.log.warning("CANCEL ignored — Call-ID mismatch: msg=\(msgCallId, privacy: .public) cur=\(self.currentCallId, privacy: .public) state=\(String(describing: self.callState), privacy: .public)")
+                }
             }
         case "OPTIONS":
             let resp = buildMirroredResponse(code: 200, reason: "OK", request: message, toTag: "")
@@ -1249,13 +1277,33 @@ final class SipHandler: ObservableObject {
     }
 
     private func handleIncomingInvite(_ message: String) {
+        let newCallId = Self.extractHeader(message, name: "Call-ID") ?? ""
+
         if callState != .idle {
-            let resp = buildMirroredResponse(code: 486, reason: "Busy Here", request: message, toTag: generateTag())
-            sendSip(resp)
-            return
+            // If the new INVITE belongs to the SAME call we're already tracking
+            // (Call-ID match), it's just an INVITE retransmit — let the regular
+            // flow re-send 180 Ringing.  Fall through.
+            //
+            // Otherwise: a DIFFERENT call is trying to ring while we're in a
+            // transient state (.incoming/.calling/.ringing).  That almost
+            // always means the previous CANCEL was lost in transit and our
+            // state is stuck.  Force-reset rather than reply 486 Busy Here,
+            // so the new caller still rings the phone — being permanently
+            // unreachable is much worse than briefly losing a non-existent
+            // dead call.  Only a truly active call (.confirmed / .hold) sends
+            // 486.
+            if newCallId != currentCallId {
+                if callState == .confirmed || callState == .hold {
+                    let resp = buildMirroredResponse(code: 486, reason: "Busy Here", request: message, toTag: generateTag())
+                    sendSip(resp)
+                    return
+                }
+                Self.log.warning("Stale transient call state \(String(describing: self.callState)) — resetting to accept new INVITE \(newCallId, privacy: .public)")
+                resetCallState()
+            }
         }
         incomingInviteMsg = message
-        currentCallId = Self.extractHeader(message, name: "Call-ID") ?? ""
+        currentCallId = newCallId
         currentLocalTag = generateTag()
         currentRemoteTag = Self.extractTag(message, headerName: "From") ?? ""
         currentCallDirection = "inbound"
@@ -1991,6 +2039,8 @@ final class SipHandler: ObservableObject {
     // MARK: - Helpers: state + IDs + addresses
 
     private func resetCallState() {
+        stuckStateWatchdog?.cancel()
+        stuckStateWatchdog = nil
         currentCallId = ""
         currentLocalTag = ""
         currentRemoteTag = ""
@@ -2099,6 +2149,41 @@ final class SipHandler: ObservableObject {
             self.remoteName = name
             self.onCallStateChanged?(state, number, name)
         }
+        scheduleStuckStateWatchdog(for: state)
+    }
+
+    /// Arms a 50-second timer when entering a transient call state.  If the
+    /// state hasn't progressed by the time the timer fires, force a
+    /// disconnect + reset.  Without this, a lost CANCEL (caller hung up but
+    /// the SIP message never reached us — common after a PushKit-driven
+    /// NAT re-binding) would leave the iPhone ringing indefinitely AND
+    /// jam callState != .idle so every subsequent INVITE replies 486 Busy.
+    private func scheduleStuckStateWatchdog(for state: CallState) {
+        stuckStateWatchdog?.cancel()
+        stuckStateWatchdog = nil
+
+        let timeoutSeconds: Int
+        switch state {
+        case .incoming, .calling, .ringing:
+            timeoutSeconds = 50           // ~ SIP T1*64 ≈ 32s + slack
+        default:
+            return                        // .confirmed / .hold / .idle etc — no watchdog
+        }
+
+        let timer = DispatchSource.makeTimerSource(queue: ioQueue)
+        timer.schedule(deadline: .now() + .seconds(timeoutSeconds))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            // Only fire if the state never moved off the one we armed for.
+            guard self.callState == state else { return }
+            Self.log.warning("Call stuck in \(String(describing: state)) for \(timeoutSeconds)s — forcing disconnect")
+            self.setCallState(.disconnected, number: self.remoteNumber, name: self.remoteName)
+            self.ioQueue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                self?.resetCallState()
+            }
+        }
+        timer.resume()
+        stuckStateWatchdog = timer
     }
 
     private func updateRegistration(_ state: RegistrationState) {

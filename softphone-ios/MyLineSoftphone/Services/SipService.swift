@@ -218,12 +218,19 @@ final class SipService: NSObject, ObservableObject {
     }
 
     /// Call when `scenePhase` becomes `.active`.
-    /// Re-registers if the SIP stack died while we were suspended.
+    /// Always restart the SIP stack on foreground.  The previous guard
+    /// (skip if `registrationState == .registered`) was wrong: iOS keeps
+    /// the SIP socket alive while we are suspended only briefly, then
+    /// drops the NAT mapping.  Our local `registrationState` may still
+    /// say `.registered` (we haven't observed the failure yet), but the
+    /// server can no longer reach us, so any in-flight INVITE is stuck
+    /// in `t_suspend` waiting for a JOIN that will never come unless we
+    /// re-REGISTER.  Restart unconditionally on foreground to flush
+    /// stale state and trigger route[JOIN] / RESUME on the SBC.
     func handleAppForeground() {
-        guard registrationState != .registered && registrationState != .registering else { return }
         let config = SettingsRepository.shared.load()
         guard config.isValid else { return }
-        Self.log.info("App foregrounded — restarting SIP stack after background loss")
+        Self.log.info("App foregrounded — restarting SIP stack to refresh NAT binding")
         sipHandler.restartForNetworkChange()
     }
 
