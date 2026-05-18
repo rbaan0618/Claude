@@ -634,11 +634,27 @@ extension SipService: PKPushRegistryDelegate {
                                   didReceiveIncomingPushWith payload: PKPushPayload,
                                   for type: PKPushType,
                                   completion: @escaping () -> Void) {
-        // Apple REQUIRES reportNewIncomingCall to be called synchronously, before
-        // completion() returns. Doing it inside Task {} is not synchronous and can
-        // cause the app to be force-terminated by the system watchdog.
+        // Apple's PushKit contract (https://developer.apple.com/documentation/pushkit
+        // /pkpushregistrydelegate/2875784-pushregistry):
+        //
+        //   * The app MUST invoke `reportNewIncomingCall` during this delegate
+        //     callback.  If iOS thinks no call was reported, it terminates the
+        //     process AND rate-limits future VoIP pushes for the bundle — often
+        //     for several hours.  Once that happens, the next dozen test calls
+        //     all silently fail even though APNs returns HTTP 200.
+        //
+        //   * The push completion handler MUST be called only AFTER
+        //     reportNewIncomingCall has completed — i.e. nested inside its
+        //     callback closure, never before it.  Calling completion() too
+        //     early is the most common cause of "push delivered but phone
+        //     doesn't ring" in shipping VoIP apps.
+        //
+        // The previous implementation invoked completion() immediately after
+        // `reportNewIncomingCall` without waiting for its async callback, which
+        // is exactly the anti-pattern Apple warns about.
         let caller     = payload.dictionaryPayload["caller"]     as? String ?? "Unknown"
         let callerName = payload.dictionaryPayload["callerName"] as? String ?? ""
+        Self.log.info("VoIP push received: caller=\(caller, privacy: .public) name=\(callerName, privacy: .public)")
 
         let uuid = UUID()
         let update = CXCallUpdate()
@@ -646,18 +662,20 @@ extension SipService: PKPushRegistryDelegate {
         update.localizedCallerName = callerName.isEmpty ? caller : callerName
         update.hasVideo = false
 
-        // Synchronous — must happen before completion() returns.
+        // 1) Report the call.  2) Inside the callback, ack the push.
         provider.reportNewIncomingCall(with: uuid, update: update) { error in
             if let error = error {
-                Self.log.error("PushKit reportNewIncomingCall: \(error.localizedDescription, privacy: .public)")
+                Self.log.error("reportNewIncomingCall failed: \(error.localizedDescription, privacy: .public)")
+            } else {
+                Self.log.info("Push-driven incoming call reported to CallKit (uuid=\(uuid))")
             }
+            completion()
         }
-        completion()
 
-        // Store UUID and wake the SIP stack on the main actor.
-        // When the SIP INVITE arrives (after re-registration), reportIncomingCall()
-        // will detect this UUID and update the existing CallKit entry instead of
-        // creating a second one.
+        // Store UUID and wake the SIP stack on the main actor.  When the SIP
+        // INVITE arrives (after our re-registration triggers route[JOIN] in
+        // Kamailio), reportIncomingCall() will detect this pre-reported UUID
+        // and update the existing CallKit entry instead of creating a second.
         Task { @MainActor in
             self.activeCallUUID = uuid
             self.isOutgoingCall = false
