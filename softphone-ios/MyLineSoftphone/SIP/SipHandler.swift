@@ -1818,11 +1818,25 @@ final class SipHandler: ObservableObject {
                 let parts = line.split(separator: " ").map(String.init)
                 if parts.count >= 2 { remoteRtpPort = Int(parts[1]) ?? 0 }
                 if parts.count >= 4 {
+                    // Build the set of payload types the peer offered.  We
+                    // ALWAYS advertise PCMU (codec 0) in our own SDP, so the
+                    // selected negotiatedCodec must be 0 whenever PCMU is in
+                    // the offer — anything else causes a one-way silence in
+                    // inbound calls (peer encodes PCMU per our answer, but
+                    // our RtpSession was set to G.729 because that was
+                    // listed first in the offer).  Fall back to the first
+                    // other compatible codec only if PCMU isn't offered at
+                    // all (extremely rare).
+                    var offered: [Int] = []
                     for i in 3..<parts.count {
-                        if let pt = Int(parts[i].trimmingCharacters(in: .whitespaces)), [0, 3, 8, 18].contains(pt) {
-                            negotiatedCodec = pt
-                            break
+                        if let pt = Int(parts[i].trimmingCharacters(in: .whitespaces)) {
+                            offered.append(pt)
                         }
+                    }
+                    if offered.contains(0) {
+                        negotiatedCodec = 0    // PCMU
+                    } else if let first = offered.first(where: { [3, 8, 18].contains($0) }) {
+                        negotiatedCodec = first
                     }
                 }
             }
@@ -1839,11 +1853,17 @@ final class SipHandler: ObservableObject {
                 let parts = line.split(separator: " ").map(String.init)
                 if parts.count >= 2 { consultRemoteRtpPort = Int(parts[1]) ?? 0 }
                 if parts.count >= 4 {
+                    // Same PCMU-preference logic as parseSdp — we always
+                    // advertise codec 0 in our SDP, so we must decode/encode
+                    // as 0 whenever it's in the offer.
+                    var offered: [Int] = []
                     for i in 3..<parts.count {
-                        if let pt = Int(parts[i]), [0, 3, 8, 18].contains(pt) {
-                            consultNegotiatedCodec = pt
-                            break
-                        }
+                        if let pt = Int(parts[i]) { offered.append(pt) }
+                    }
+                    if offered.contains(0) {
+                        consultNegotiatedCodec = 0
+                    } else if let first = offered.first(where: { [3, 8, 18].contains($0) }) {
+                        consultNegotiatedCodec = first
                     }
                 }
             }
