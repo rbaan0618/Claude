@@ -529,31 +529,30 @@ final class SipService: NSObject, ObservableObject {
         update.localizedCallerName = name.isEmpty ? number : name
         update.hasVideo = false
 
-        // VERIFY the pre-reported UUID is actually a LIVE CallKit call before
-        // trying to update it.  `pushPrereportedUUID == activeCallUUID` always
-        // matches (the push handler sets both to the same UUID) but that
-        // doesn't mean CallKit is currently displaying anything — iOS may have
-        // rate-limited the push (no UI ever shown) or the user may have
-        // dismissed the call.  Without the CXCallObserver check we would
-        // silently call reportCall(updated:) on a dead UUID, leaving the user
-        // with no CallKit ring screen even though the SIP INVITE arrived,
-        // 180 Ringing was sent, and everything else looks normal.
-        if let existingUUID = pushPrereportedUUID,
-           existingUUID == activeCallUUID,
-           callObserver.calls.contains(where: { $0.uuid == existingUUID && !$0.hasEnded }) {
-            Self.log.info("Updating existing push-prereported CallKit call \(existingUUID)")
-            provider.reportCall(with: existingUUID, updated: update)
-            pushPrereportedUUID = nil
-            return
+        // ALWAYS issue a fresh reportNewIncomingCall when a real SIP INVITE
+        // arrives.  We previously tried to "update" an existing push-
+        // prereported entry via reportCall(updated:) but that approach is
+        // brittle — if iOS rate-limited the original push (very common when
+        // the APNs token is stale or the bundle is in cooldown after a
+        // recent PushKit contract violation), CallKit registers the UUID
+        // internally yet never displays a UI.  reportCall(updated:) then
+        // silently does nothing and the user sees no ring screen even
+        // though the SIP INVITE arrived, 180 Ringing was sent, the codec
+        // was negotiated, etc.
+        //
+        // To be safe in all cases we end the previous CallKit call (if any
+        // is still alive) and report a brand-new call with a fresh UUID.
+        // The downside is a tiny UX glitch in the rare scenario where push
+        // genuinely showed a UI — the old entry disappears and the new one
+        // appears.  That's an order of magnitude better than the bug it
+        // replaces (no incoming call display at all).
+        if let previousUUID = activeCallUUID,
+           callObserver.calls.contains(where: { $0.uuid == previousUUID && !$0.hasEnded }) {
+            Self.log.warning("Ending stale CallKit entry \(previousUUID) before reporting fresh incoming call")
+            provider.reportCall(with: previousUUID, endedAt: Date(), reason: .failed)
         }
-
-        // Either no push pre-report, or the pre-reported UUID isn't a live
-        // call in CallKit anymore — issue a fresh reportNewIncomingCall.
-        if let stale = pushPrereportedUUID {
-            Self.log.warning("Discarding stale pushPrereportedUUID \(stale) (CallKit has no live call for it) — creating fresh entry")
-            pushPrereportedUUID = nil
-        }
-        activeCallUUID = nil   // any previous activeCallUUID is now stale too
+        pushPrereportedUUID = nil
+        activeCallUUID = nil
 
         let uuid = UUID()
         activeCallUUID = uuid
