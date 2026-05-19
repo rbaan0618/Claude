@@ -91,6 +91,23 @@ final class SipService: NSObject, ObservableObject {
         super.init()
         self.provider.setDelegate(self, queue: nil)
 
+        // CallKit warm-up: on a fresh install, the FIRST reportNewIncomingCall
+        // is sometimes silently swallowed by iOS because the system call
+        // display service hasn't fully bound our CXProvider yet — the user's
+        // very first inbound call doesn't display a ring screen even though
+        // the SIP layer behaves perfectly.  Reporting (then immediately
+        // ending) a synthetic call here forces the system to register our
+        // provider so the next real call works.  iOS does not show the UI
+        // because we end it well before any display animation can fire.
+        let warmUpUUID = UUID()
+        let warmUpUpdate = CXCallUpdate()
+        warmUpUpdate.remoteHandle = CXHandle(type: .generic, value: "warmup")
+        warmUpUpdate.localizedCallerName = ""
+        warmUpUpdate.hasVideo = false
+        provider.reportNewIncomingCall(with: warmUpUUID, update: warmUpUpdate) { [weak self] _ in
+            self?.provider.reportCall(with: warmUpUUID, endedAt: Date(), reason: .failed)
+        }
+
         pushRegistry.delegate = self
         pushRegistry.desiredPushTypes = [.voIP]
 
