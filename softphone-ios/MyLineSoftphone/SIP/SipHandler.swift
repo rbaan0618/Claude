@@ -328,26 +328,25 @@ final class SipHandler: ObservableObject {
             let sdp = self.buildSdp(rtpPort: self.localRtpPort, holdMode: false)
             let contactAddr = self.contactAddress()
 
-            let viaHeader = Self.extractHeader(invite, name: "Via") ?? ""
-            let fromHeader = Self.extractHeader(invite, name: "From") ?? ""
-            let toHeader = Self.extractHeader(invite, name: "To") ?? ""
-            let cseqHeader = Self.extractHeader(invite, name: "CSeq") ?? ""
-
-            let toWithTag = toHeader.contains("tag=") ? toHeader : "\(toHeader);tag=\(self.currentLocalTag)"
-
-            let sdpBytes = sdp.data(using: .utf8)?.count ?? 0
-            let response =
-                "SIP/2.0 200 OK\r\n" +
-                "Via: \(viaHeader)\r\n" +
-                "From: \(fromHeader)\r\n" +
-                "To: \(toWithTag)\r\n" +
-                "Call-ID: \(self.currentCallId)\r\n" +
-                "CSeq: \(cseqHeader)\r\n" +
-                "Contact: <sip:\(self.config.username)@\(contactAddr)>\r\n" +
-                "Content-Type: application/sdp\r\n" +
-                "User-Agent: MyLineTelecom-iOS/1.0\r\n" +
-                "Content-Length: \(sdpBytes)\r\n\r\n" +
-                sdp
+            // Use buildMirroredResponse so the 200 OK echoes EVERY Via from
+            // the INVITE (RFC 3261 §17.2.1).  Building this manually with
+            // just the top Via was silently dropping the answer at the SBC:
+            // dSIPRouter popped its own Via and found no more hops to forward
+            // to FusionPBX.  FusionPBX therefore never saw the call as
+            // answered, no RTP was set up, and the iPhone's CallKit UI was
+            // the only thing that thought the call was live.
+            let response = self.buildMirroredResponse(
+                code: 200,
+                reason: "OK",
+                request: invite,
+                toTag: self.currentLocalTag,
+                extraHeaders: [
+                    ("Contact", "<sip:\(self.config.username)@\(contactAddr)>"),
+                    ("Content-Type", "application/sdp"),
+                    ("Allow", "INVITE,ACK,BYE,CANCEL,OPTIONS,NOTIFY,REFER"),
+                ],
+                body: sdp
+            )
 
             self.sendSip(response)
             self.setCallState(.confirmed, number: self.remoteNumber, name: self.remoteName)
@@ -1338,50 +1337,34 @@ final class SipHandler: ObservableObject {
     private func handleReInvite(_ message: String) {
         parseSdp(message)
         let sdp = buildSdp(rtpPort: localRtpPort, holdMode: callState == .hold)
-        let viaHeader = Self.extractHeader(message, name: "Via") ?? ""
-        let fromHeader = Self.extractHeader(message, name: "From") ?? ""
-        let toHeader = Self.extractHeader(message, name: "To") ?? ""
-        let cseqHeader = Self.extractHeader(message, name: "CSeq") ?? ""
-        let toWithTag = (!toHeader.contains("tag=") && !currentLocalTag.isEmpty)
-            ? "\(toHeader);tag=\(currentLocalTag)" : toHeader
-        let sdpBytes = sdp.data(using: .utf8)?.count ?? 0
-        let response =
-            "SIP/2.0 200 OK\r\n" +
-            "Via: \(viaHeader)\r\n" +
-            "From: \(fromHeader)\r\n" +
-            "To: \(toWithTag)\r\n" +
-            "Call-ID: \(currentCallId)\r\n" +
-            "CSeq: \(cseqHeader)\r\n" +
-            "Contact: <sip:\(config.username)@\(contactAddress())>\r\n" +
-            "Content-Type: application/sdp\r\n" +
-            "User-Agent: MyLineTelecom-iOS/1.0\r\n" +
-            "Content-Length: \(sdpBytes)\r\n\r\n" +
-            sdp
+        let response = buildMirroredResponse(
+            code: 200,
+            reason: "OK",
+            request: message,
+            toTag: currentLocalTag,
+            extraHeaders: [
+                ("Contact", "<sip:\(config.username)@\(contactAddress())>"),
+                ("Content-Type", "application/sdp"),
+            ],
+            body: sdp
+        )
         sendSip(response)
     }
 
     private func handleConsultReInvite(_ message: String) {
         parseConsultSdp(message)
         let sdp = buildSdp(rtpPort: consultRtpPort, holdMode: false)
-        let viaHeader = Self.extractHeader(message, name: "Via") ?? ""
-        let fromHeader = Self.extractHeader(message, name: "From") ?? ""
-        let toHeader = Self.extractHeader(message, name: "To") ?? ""
-        let cseqHeader = Self.extractHeader(message, name: "CSeq") ?? ""
-        let toWithTag = (!toHeader.contains("tag=") && !consultLocalTag.isEmpty)
-            ? "\(toHeader);tag=\(consultLocalTag)" : toHeader
-        let sdpBytes = sdp.data(using: .utf8)?.count ?? 0
-        let response =
-            "SIP/2.0 200 OK\r\n" +
-            "Via: \(viaHeader)\r\n" +
-            "From: \(fromHeader)\r\n" +
-            "To: \(toWithTag)\r\n" +
-            "Call-ID: \(consultCallId)\r\n" +
-            "CSeq: \(cseqHeader)\r\n" +
-            "Contact: <sip:\(config.username)@\(contactAddress())>\r\n" +
-            "Content-Type: application/sdp\r\n" +
-            "User-Agent: MyLineTelecom-iOS/1.0\r\n" +
-            "Content-Length: \(sdpBytes)\r\n\r\n" +
-            sdp
+        let response = buildMirroredResponse(
+            code: 200,
+            reason: "OK",
+            request: message,
+            toTag: consultLocalTag,
+            extraHeaders: [
+                ("Contact", "<sip:\(config.username)@\(contactAddress())>"),
+                ("Content-Type", "application/sdp"),
+            ],
+            body: sdp
+        )
         sendSip(response)
     }
 
@@ -1749,14 +1732,23 @@ final class SipHandler: ObservableObject {
         return sb
     }
 
-    private func buildMirroredResponse(code: Int, reason: String, request: String, toTag: String) -> String {
+    private func buildMirroredResponse(
+        code: Int,
+        reason: String,
+        request: String,
+        toTag: String,
+        extraHeaders: [(String, String)] = [],
+        body: String = ""
+    ) -> String {
         // Echo ALL Via headers from the request, in order — required by RFC 3261
         // §17.2.1.  When a proxy chain forwards a request, each hop adds its own
         // Via on top; the response MUST contain every Via from the request so
         // each proxy can pop its own and forward upstream.  Previously we only
         // echoed the top Via, which caused FusionPBX to never see our 200 OK
         // for MESSAGE/BYE and retransmit indefinitely (each retransmit re-fires
-        // the iOS message receive path, producing duplicate chat entries).
+        // the iOS message receive path, producing duplicate chat entries) AND
+        // caused the 200 OK to an answered INVITE to be silently dropped — the
+        // iPhone displayed "connected" but FusionPBX never saw an answer.
         let vias = Self.extractAllHeaders(request, name: "Via")
         let viaLines = vias.map { "Via: \($0)\r\n" }.joined()
         let from = Self.extractHeader(request, name: "From") ?? ""
@@ -1764,15 +1756,22 @@ final class SipHandler: ObservableObject {
         let callId = Self.extractHeader(request, name: "Call-ID") ?? ""
         let cseq = Self.extractHeader(request, name: "CSeq") ?? ""
         let toWithTag = (!toTag.isEmpty && !to.contains("tag=")) ? "\(to);tag=\(toTag)" : to
-        return
-            "SIP/2.0 \(code) \(reason)\r\n" +
-            viaLines +
-            "From: \(from)\r\n" +
-            "To: \(toWithTag)\r\n" +
-            "Call-ID: \(callId)\r\n" +
-            "CSeq: \(cseq)\r\n" +
-            "User-Agent: MyLineTelecom-iOS/1.0\r\n" +
-            "Content-Length: 0\r\n\r\n"
+        let bodyBytes = body.data(using: .utf8)?.count ?? 0
+
+        var sb = ""
+        sb += "SIP/2.0 \(code) \(reason)\r\n"
+        sb += viaLines
+        sb += "From: \(from)\r\n"
+        sb += "To: \(toWithTag)\r\n"
+        sb += "Call-ID: \(callId)\r\n"
+        sb += "CSeq: \(cseq)\r\n"
+        sb += "User-Agent: MyLineTelecom-iOS/1.0\r\n"
+        for (k, v) in extraHeaders {
+            sb += "\(k): \(v)\r\n"
+        }
+        sb += "Content-Length: \(bodyBytes)\r\n\r\n"
+        if !body.isEmpty { sb += body }
+        return sb
     }
 
     // MARK: - SDP
