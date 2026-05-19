@@ -218,19 +218,32 @@ final class SipService: NSObject, ObservableObject {
     }
 
     /// Call when `scenePhase` becomes `.active`.
-    /// Always restart the SIP stack on foreground.  The previous guard
-    /// (skip if `registrationState == .registered`) was wrong: iOS keeps
-    /// the SIP socket alive while we are suspended only briefly, then
-    /// drops the NAT mapping.  Our local `registrationState` may still
-    /// say `.registered` (we haven't observed the failure yet), but the
-    /// server can no longer reach us, so any in-flight INVITE is stuck
-    /// in `t_suspend` waiting for a JOIN that will never come unless we
-    /// re-REGISTER.  Restart unconditionally on foreground to flush
-    /// stale state and trigger route[JOIN] / RESUME on the SBC.
+    ///
+    /// Re-register only if the SIP stack appears dead — never blindly
+    /// restart, because `restartForNetworkChange()` tears down the UDP
+    /// socket and any in-flight INVITE.  Doing it on every foreground
+    /// transition was the cause of "iPhone no longer receives calls in
+    /// foreground or background" — when the user opened the app in
+    /// response to a CallKit-displayed incoming call, the restart
+    /// closed the very socket that had just delivered the INVITE.
+    ///
+    /// If we are in the middle of an active call (.confirmed / .hold /
+    /// .incoming / .calling / .ringing) we ALWAYS skip the restart so
+    /// the in-flight transaction isn't torn down.
     func handleAppForeground() {
+        // Never disturb a live or in-progress call.
+        switch callState {
+        case .idle, .disconnected:
+            break
+        default:
+            Self.log.info("App foregrounded during active call (\(String(describing: callState))) — skipping SIP restart")
+            return
+        }
+        // Already registered/registering on a fresh socket — nothing to do.
+        guard registrationState != .registered && registrationState != .registering else { return }
         let config = SettingsRepository.shared.load()
         guard config.isValid else { return }
-        Self.log.info("App foregrounded — restarting SIP stack to refresh NAT binding")
+        Self.log.info("App foregrounded — restarting SIP stack after background loss")
         sipHandler.restartForNetworkChange()
     }
 
