@@ -48,6 +48,14 @@ final class SipService: NSObject, ObservableObject {
     // CallKit
     private let provider: CXProvider
     private let callController = CXCallController()
+    /// Observes ALL CallKit calls — used to verify whether a UUID we received
+    /// from PushKit is actually still alive in CallKit before issuing
+    /// `reportCall(updated:)` on it.  Without this check, a stale
+    /// `pushPrereportedUUID` (e.g. iOS rate-limited the push and never
+    /// displayed the original report) causes reportCall(updated:) to silently
+    /// do nothing, leaving the user with no incoming-call UI for what is
+    /// otherwise a perfectly-signalled SIP INVITE (180 Ringing sent, etc.).
+    private let callObserver = CXCallObserver()
     private var activeCallUUID: UUID?
     private var isOutgoingCall: Bool = false
 
@@ -521,32 +529,41 @@ final class SipService: NSObject, ObservableObject {
         update.localizedCallerName = name.isEmpty ? number : name
         update.hasVideo = false
 
-        // If PushKit already reported this call to CallKit AND that call is still
-        // the live one (activeCallUUID matches), just update the caller info on
-        // the existing entry instead of creating a duplicate call UUID.
-        //
-        // Safety: if pushPrereportedUUID is stale (the push-reported call was
-        // dismissed/cancelled but the UUID was never cleared), DO NOT use it —
-        // CallKit has no record of that UUID, so reportCall(updated:) silently
-        // does nothing and the new call would never display. Fall through to
-        // reportNewIncomingCall instead.
-        if let existingUUID = pushPrereportedUUID, existingUUID == activeCallUUID {
+        // VERIFY the pre-reported UUID is actually a LIVE CallKit call before
+        // trying to update it.  `pushPrereportedUUID == activeCallUUID` always
+        // matches (the push handler sets both to the same UUID) but that
+        // doesn't mean CallKit is currently displaying anything — iOS may have
+        // rate-limited the push (no UI ever shown) or the user may have
+        // dismissed the call.  Without the CXCallObserver check we would
+        // silently call reportCall(updated:) on a dead UUID, leaving the user
+        // with no CallKit ring screen even though the SIP INVITE arrived,
+        // 180 Ringing was sent, and everything else looks normal.
+        if let existingUUID = pushPrereportedUUID,
+           existingUUID == activeCallUUID,
+           callObserver.calls.contains(where: { $0.uuid == existingUUID && !$0.hasEnded }) {
+            Self.log.info("Updating existing push-prereported CallKit call \(existingUUID)")
             provider.reportCall(with: existingUUID, updated: update)
-            pushPrereportedUUID = nil   // consumed
+            pushPrereportedUUID = nil
             return
         }
-        if pushPrereportedUUID != nil {
-            // Stale UUID — log and clear so the next branch creates a fresh call.
-            Self.log.warning("Discarding stale pushPrereportedUUID before new INVITE")
+
+        // Either no push pre-report, or the pre-reported UUID isn't a live
+        // call in CallKit anymore — issue a fresh reportNewIncomingCall.
+        if let stale = pushPrereportedUUID {
+            Self.log.warning("Discarding stale pushPrereportedUUID \(stale) (CallKit has no live call for it) — creating fresh entry")
             pushPrereportedUUID = nil
         }
+        activeCallUUID = nil   // any previous activeCallUUID is now stale too
 
         let uuid = UUID()
         activeCallUUID = uuid
         isOutgoingCall = false
+        Self.log.info("reportNewIncomingCall caller=\(number, privacy: .public) name=\(name, privacy: .public) uuid=\(uuid)")
         provider.reportNewIncomingCall(with: uuid, update: update) { error in
             if let error = error {
                 Self.log.error("reportNewIncomingCall failed: \(error.localizedDescription, privacy: .public)")
+            } else {
+                Self.log.info("CallKit accepted incoming-call report uuid=\(uuid)")
             }
         }
     }
