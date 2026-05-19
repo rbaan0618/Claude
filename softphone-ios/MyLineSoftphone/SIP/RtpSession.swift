@@ -142,33 +142,57 @@ final class RtpSession {
     }
 
     /// Toggle output route between earpiece and speaker.
-    /// In .voiceChat mode the Voice Processing I/O unit (vpio) leaves the engine
-    /// in a "soft-broken" state on route change — isRunning returns true but
-    /// audio doesn't flow.  Solution: pause BEFORE the override, start AFTER.
-    /// This forces vpio to fully reconfigure for the new route.
+    ///
+    /// The Voice Processing I/O unit (vpio) used by .voiceChat mode is very
+    /// fragile across route changes — pausing the engine, switching the
+    /// route, then restarting (the previous approach) frequently left vpio
+    /// in a "soft-broken" state with isRunning=true but no actual audio
+    /// flowing.  The user reported "speaker breaks all audio" repeatedly.
+    ///
+    /// The reliable fix is a full tear-down + rebuild of the audio engine
+    /// after the route change.  Tap is reinstalled, vpio is re-allocated
+    /// for the new route, and capture/playback resume cleanly.  There is a
+    /// ~200 ms gap audible to both parties but it is far better than the
+    /// indefinite silence the pause-only approach produced.
     /// Called from SipService.setSpeaker via SipHandler on the ioQueue.
     func setSpeakerOutput(_ on: Bool) {
         let session = AVAudioSession.sharedInstance()
         do {
-            // 1. Pause player + engine (releases vpio cleanly, preserves graph/taps).
-            player?.pause()
-            engine.pause()
+            // 1. Stop the player + engine completely.  Pause is not enough —
+            //    vpio needs to be released so the OS can reconfigure for the
+            //    new route.
+            player?.stop()
+            if engine.isRunning { engine.stop() }
+            removeTaps()
 
-            // 2. Change the audio route while engine is idle.
+            // 2. Change the audio route while everything is torn down.
             try session.overrideOutputAudioPort(on ? .speaker : .none)
 
-            // 3. Restart the engine — vpio reconfigures for the new route.
-            try engine.start()
-            player?.play()
+            // 3. Rebuild the engine for the new route.  startAudioEngine
+            //    reattaches the player node, reinstalls the input tap, and
+            //    starts the engine clean — exactly the path taken on first
+            //    call setup, which is known to work.
+            startAudioEngine()
 
             Self.log.info("Speaker \(on ? "ON" : "OFF", privacy: .public) — engine running=\(self.engine.isRunning)")
         } catch {
             Self.log.error("setSpeakerOutput failed: \(String(describing: error), privacy: .public)")
-            // Best-effort recovery: try to restart engine if it stopped.
             if !engine.isRunning {
                 try? engine.start()
                 player?.play()
             }
+        }
+    }
+
+    /// Remove any installed taps + detach the existing player node so
+    /// startAudioEngine() can install fresh ones without colliding.  Tap
+    /// collisions and node duplicates surface as silent failures, not
+    /// errors.
+    private func removeTaps() {
+        engine.inputNode.removeTap(onBus: 0)
+        if let oldPlayer = player {
+            engine.detach(oldPlayer)
+            player = nil
         }
     }
 
