@@ -236,7 +236,7 @@ final class SipService: NSObject, ObservableObject {
         case .idle, .disconnected:
             break
         default:
-            Self.log.info("App foregrounded during active call (\(String(describing: callState))) — skipping SIP restart")
+            Self.log.info("App foregrounded during active call (\(String(describing: self.callState))) — skipping SIP restart")
             return
         }
         // Already registered/registering on a fresh socket — nothing to do.
