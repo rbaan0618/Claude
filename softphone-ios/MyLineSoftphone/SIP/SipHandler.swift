@@ -1277,6 +1277,7 @@ final class SipHandler: ObservableObject {
 
     private func handleIncomingInvite(_ message: String) {
         let newCallId = Self.extractHeader(message, name: "Call-ID") ?? ""
+        DebugLog.shared.write("SIP", "INVITE received Call-ID=\(newCallId) currentState=\(String(describing: callState))")
 
         if callState != .idle {
             // If the new INVITE belongs to the SAME call we're already tracking

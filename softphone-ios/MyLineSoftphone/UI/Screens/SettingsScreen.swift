@@ -40,6 +40,11 @@ struct SettingsScreen: View {
                 Section("Status") {
                     LabeledContent("Registration", value: service.registrationState.rawValue.capitalized)
                 }
+                Section("Diagnostics") {
+                    NavigationLink("View Diagnostic Logs") {
+                        DebugLogScreen()
+                    }
+                }
                 Section {
                     Button("Save & Reconnect") {
                         SettingsRepository.shared.save(config)

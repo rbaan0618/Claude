@@ -524,31 +524,18 @@ final class SipService: NSObject, ObservableObject {
     }
 
     private func reportIncomingCall(number: String, name: String) {
+        DebugLog.shared.write("CallKit", "reportIncomingCall fired caller=\(number) name=\(name)")
         let update = CXCallUpdate()
         update.remoteHandle = CXHandle(type: .phoneNumber, value: number)
         update.localizedCallerName = name.isEmpty ? number : name
         update.hasVideo = false
 
-        // ALWAYS issue a fresh reportNewIncomingCall when a real SIP INVITE
-        // arrives.  We previously tried to "update" an existing push-
-        // prereported entry via reportCall(updated:) but that approach is
-        // brittle — if iOS rate-limited the original push (very common when
-        // the APNs token is stale or the bundle is in cooldown after a
-        // recent PushKit contract violation), CallKit registers the UUID
-        // internally yet never displays a UI.  reportCall(updated:) then
-        // silently does nothing and the user sees no ring screen even
-        // though the SIP INVITE arrived, 180 Ringing was sent, the codec
-        // was negotiated, etc.
-        //
-        // To be safe in all cases we end the previous CallKit call (if any
-        // is still alive) and report a brand-new call with a fresh UUID.
-        // The downside is a tiny UX glitch in the rare scenario where push
-        // genuinely showed a UI — the old entry disappears and the new one
-        // appears.  That's an order of magnitude better than the bug it
-        // replaces (no incoming call display at all).
+        // Always issue a fresh reportNewIncomingCall when a real SIP INVITE
+        // arrives — see commit history for rationale.
         if let previousUUID = activeCallUUID,
            callObserver.calls.contains(where: { $0.uuid == previousUUID && !$0.hasEnded }) {
             Self.log.warning("Ending stale CallKit entry \(previousUUID) before reporting fresh incoming call")
+            DebugLog.shared.write("CallKit", "ending stale UUID \(previousUUID) before fresh report")
             provider.reportCall(with: previousUUID, endedAt: Date(), reason: .failed)
         }
         pushPrereportedUUID = nil
@@ -558,11 +545,14 @@ final class SipService: NSObject, ObservableObject {
         activeCallUUID = uuid
         isOutgoingCall = false
         Self.log.info("reportNewIncomingCall caller=\(number, privacy: .public) name=\(name, privacy: .public) uuid=\(uuid)")
+        DebugLog.shared.write("CallKit", "reportNewIncomingCall uuid=\(uuid.uuidString.prefix(8))")
         provider.reportNewIncomingCall(with: uuid, update: update) { error in
             if let error = error {
                 Self.log.error("reportNewIncomingCall failed: \(error.localizedDescription, privacy: .public)")
+                DebugLog.shared.write("CallKit", "❌ reportNewIncomingCall FAILED: \(error.localizedDescription)")
             } else {
                 Self.log.info("CallKit accepted incoming-call report uuid=\(uuid)")
+                DebugLog.shared.write("CallKit", "✓ CallKit accepted report uuid=\(uuid.uuidString.prefix(8))")
             }
         }
     }

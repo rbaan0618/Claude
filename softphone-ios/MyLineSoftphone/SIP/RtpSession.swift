@@ -153,6 +153,7 @@ final class RtpSession {
     /// Called from SipService.setSpeaker via SipHandler on the ioQueue.
     func setSpeakerOutput(_ on: Bool) {
         let session = AVAudioSession.sharedInstance()
+        DebugLog.shared.write("Speaker", "request \(on ? "ON" : "OFF")")
         do {
             let mode: AVAudioSession.Mode = on ? .videoChat : .voiceChat
             let options: AVAudioSession.CategoryOptions = on
@@ -160,12 +161,12 @@ final class RtpSession {
                 : [.allowBluetoothHFP]
             try session.setCategory(.playAndRecord, mode: mode, options: options)
             try session.overrideOutputAudioPort(on ? .speaker : .none)
-            // Log the actual route iOS settled on so we can diagnose if the
-            // override silently failed.
             let outputs = session.currentRoute.outputs.map { "\($0.portType.rawValue)" }.joined(separator: ",")
             Self.log.info("Speaker \(on ? "ON" : "OFF", privacy: .public) — engine.isRunning=\(self.engine.isRunning) route=\(outputs, privacy: .public)")
+            DebugLog.shared.write("Speaker", "\(on ? "ON" : "OFF") applied. engine=\(self.engine.isRunning ? "running" : "STOPPED") route=\(outputs)")
         } catch {
             Self.log.error("setSpeakerOutput failed: \(String(describing: error), privacy: .public)")
+            DebugLog.shared.write("Speaker", "❌ failed: \(error.localizedDescription)")
         }
     }
 
