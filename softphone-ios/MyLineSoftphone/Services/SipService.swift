@@ -58,9 +58,6 @@ final class SipService: NSObject, ObservableObject {
     private let callObserver = CXCallObserver()
     private var activeCallUUID: UUID?
     private var isOutgoingCall: Bool = false
-    /// True once we have done a one-time CallKit warm-up after first
-    /// successful REGISTER.  See onRegistrationChanged in init().
-    private var didWarmCallKit: Bool = false
 
     // PushKit
     private let pushRegistry = PKPushRegistry(queue: .main)
@@ -110,23 +107,7 @@ final class SipService: NSObject, ObservableObject {
         // Forward registration state so SettingsScreen re-renders.
         sipHandler.onRegistrationChanged = { [weak self] state in
             Task { @MainActor in
-                guard let self else { return }
-                let wasRegistered = self.registrationState == .registered
-                self.registrationState = state
-                // Warm CallKit AFTER the first successful registration of
-                // this app lifetime.  The earlier warm-up in init() runs
-                // before iOS has fully recognized the freshly-installed app
-                // as a VoIP app (especially on the very first launch where
-                // the user must still enter credentials and save), so the
-                // synthetic call gets ignored by the system call display
-                // service.  Doing it once registration has actually
-                // succeeded gives iOS time to finish binding the bundle's
-                // VoIP capabilities, dramatically improving the chance the
-                // very first real inbound call rings.
-                if state == .registered && !wasRegistered && !self.didWarmCallKit {
-                    self.didWarmCallKit = true
-                    self.warmUpCallKit()
-                }
+                self?.registrationState = state
             }
         }
 
@@ -213,24 +194,6 @@ final class SipService: NSObject, ObservableObject {
 
     func stop() {
         sipHandler.stop()
-    }
-
-    /// Report (then immediately end) a synthetic incoming call to force
-    /// iOS's call display service to bind our CXProvider.  Called once,
-    /// shortly after the FIRST successful REGISTER, so iOS has had time
-    /// to register the freshly-installed app as a VoIP app.  Without this
-    /// the very first real incoming call after a clean install is
-    /// frequently silently swallowed and never displays a ring screen.
-    private func warmUpCallKit() {
-        let warmUpUUID = UUID()
-        let update = CXCallUpdate()
-        update.remoteHandle = CXHandle(type: .generic, value: "warmup")
-        update.localizedCallerName = ""
-        update.hasVideo = false
-        Self.log.info("CallKit warm-up: reporting+ending synthetic call \(warmUpUUID)")
-        provider.reportNewIncomingCall(with: warmUpUUID, update: update) { [weak self] _ in
-            self?.provider.reportCall(with: warmUpUUID, endedAt: Date(), reason: .failed)
-        }
     }
 
     /// Toggle earpiece ↔ speaker during an active call.

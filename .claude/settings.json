@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__ccd_session_mgmt__search_session_transcripts",
+      "mcp__Desktop_Commander__read_process_output",
+      "mcp__Desktop_Commander__list_sessions",
+      "mcp__Desktop_Commander__read_file",
+      "Bash(where *)"
+    ]
+  }
+}

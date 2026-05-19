@@ -143,27 +143,27 @@ final class RtpSession {
 
     /// Toggle output route between earpiece and speaker.
     ///
-    /// Apple's recommended pattern is a bare `overrideOutputAudioPort`
-    /// without touching the audio engine — the engine remains running and
-    /// vpio reroutes internally.  Previous attempts to "help" this
-    /// transition by pausing or rebuilding the engine produced the
-    /// opposite of the intended effect (vpio left in a soft-broken state
-    /// with no audio at all).
-    ///
-    /// Re-asserting the category with `.defaultToSpeaker` (when going to
-    /// speaker) is required because some iOS versions ignore
-    /// `overrideOutputAudioPort(.speaker)` while in `.voiceChat` mode
-    /// unless `.defaultToSpeaker` is also present in the category options.
+    /// Different iOS releases honour different subsets of:
+    ///   - category option `.defaultToSpeaker`
+    ///   - audio session `.mode` (`.voiceChat` → earpiece, `.videoChat` → speaker)
+    ///   - `overrideOutputAudioPort(.speaker / .none)`
+    /// We apply ALL three so at least one channel of the route hint takes
+    /// effect on whatever iPhone / iOS combination the user is on.  vpio
+    /// is left alone (touching the engine reliably breaks audio).
     /// Called from SipService.setSpeaker via SipHandler on the ioQueue.
     func setSpeakerOutput(_ on: Bool) {
         let session = AVAudioSession.sharedInstance()
         do {
+            let mode: AVAudioSession.Mode = on ? .videoChat : .voiceChat
             let options: AVAudioSession.CategoryOptions = on
                 ? [.allowBluetoothHFP, .defaultToSpeaker]
                 : [.allowBluetoothHFP]
-            try session.setCategory(.playAndRecord, mode: .voiceChat, options: options)
+            try session.setCategory(.playAndRecord, mode: mode, options: options)
             try session.overrideOutputAudioPort(on ? .speaker : .none)
-            Self.log.info("Speaker \(on ? "ON" : "OFF", privacy: .public) — engine.isRunning=\(self.engine.isRunning)")
+            // Log the actual route iOS settled on so we can diagnose if the
+            // override silently failed.
+            let outputs = session.currentRoute.outputs.map { "\($0.portType.rawValue)" }.joined(separator: ",")
+            Self.log.info("Speaker \(on ? "ON" : "OFF", privacy: .public) — engine.isRunning=\(self.engine.isRunning) route=\(outputs, privacy: .public)")
         } catch {
             Self.log.error("setSpeakerOutput failed: \(String(describing: error), privacy: .public)")
         }
