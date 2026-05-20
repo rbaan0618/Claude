@@ -155,27 +155,35 @@ final class RtpSession {
         let session = AVAudioSession.sharedInstance()
         DebugLog.shared.write("Speaker", "request \(on ? "ON" : "OFF")")
         do {
-            // Apple's recommended pattern is to use ONLY `overrideOutputAudioPort`
-            // for a runtime route switch.  The category is already
-            // `.playAndRecord` (configured at call start) so the override is
-            // honoured without any further setup.
-            //
-            // The previous implementation called `setCategory` with different
-            // options on every toggle.  iOS reacted to that by implicitly
-            // stopping vpio — engine.isRunning went to false, the input tap
-            // was dropped, and the player node lost its scheduled buffers.
-            // Restarting the engine restored isRunning=true but the audio
-            // graph stayed hollow (no mic capture, nothing for the speaker
-            // to play), so the user still heard nothing.  Diagnostic log
-            // proved this exact failure mode.
-            //
-            // Skipping setCategory keeps vpio alive across the toggle.  No
-            // engine restart needed; route changes are instant.
+            // 1) Change the route.
             try session.overrideOutputAudioPort(on ? .speaker : .none)
 
+            // 2) Full audio-graph rebuild.  Diagnostic logs proved that
+            // neither "override-only" nor "engine restart after setCategory"
+            // is sufficient on iOS 17/18 — the route changes correctly but
+            // the player node + input tap end up disconnected from vpio,
+            // so audio dies silently in both directions.  The only thing
+            // that has consistently worked across iOS releases is a full
+            // tear-down + re-attach of the AVAudioEngine graph after the
+            // route change.
+            DebugLog.shared.write("Speaker", "tearing down audio graph")
+            if engine.isRunning { engine.stop() }
+            engine.inputNode.removeTap(onBus: 0)
+            if let oldPlayer = player {
+                engine.detach(oldPlayer)
+                player = nil
+            }
+
+            // 3) Rebuild via the same path used at call start.
+            DebugLog.shared.write("Speaker", "rebuilding audio graph for new route")
+            startAudioEngine()
+
+            // 4) Report what iOS settled on.
             let outputs = session.currentRoute.outputs.map { "\($0.portType.rawValue)" }.joined(separator: ",")
-            Self.log.info("Speaker \(on ? "ON" : "OFF", privacy: .public) — engine.isRunning=\(self.engine.isRunning) route=\(outputs, privacy: .public)")
-            DebugLog.shared.write("Speaker", "\(on ? "ON" : "OFF") applied. engine=\(self.engine.isRunning ? "running" : "STOPPED") route=\(outputs)")
+            let inputs  = session.currentRoute.inputs.map  { "\($0.portType.rawValue)" }.joined(separator: ",")
+            let hwSampleRate = session.sampleRate
+            Self.log.info("Speaker \(on ? "ON" : "OFF", privacy: .public) — engine.isRunning=\(self.engine.isRunning) out=\(outputs, privacy: .public) in=\(inputs, privacy: .public) hwSR=\(hwSampleRate)")
+            DebugLog.shared.write("Speaker", "\(on ? "ON" : "OFF") rebuilt. engine=\(self.engine.isRunning ? "running" : "STOPPED") out=\(outputs) in=\(inputs) hwSR=\(Int(hwSampleRate))")
         } catch {
             Self.log.error("setSpeakerOutput failed: \(String(describing: error), privacy: .public)")
             DebugLog.shared.write("Speaker", "❌ failed: \(error.localizedDescription)")
