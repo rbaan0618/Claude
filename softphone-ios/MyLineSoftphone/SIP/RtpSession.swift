@@ -161,6 +161,20 @@ final class RtpSession {
                 : [.allowBluetoothHFP]
             try session.setCategory(.playAndRecord, mode: mode, options: options)
             try session.overrideOutputAudioPort(on ? .speaker : .none)
+
+            // setCategory with different options can implicitly stop the
+            // AVAudioEngine — iOS internally tears down vpio and the engine
+            // is left in `!isRunning` state.  This was the bug behind
+            // "toggle speaker OFF kills all audio": route is correct
+            // (Receiver) but engine.isRunning=false so no PCM flows.
+            // Restart the engine + player whenever the toggle left them
+            // stopped.
+            if !engine.isRunning {
+                DebugLog.shared.write("Speaker", "engine stopped after setCategory — restarting")
+                try engine.start()
+                player?.play()
+            }
+
             let outputs = session.currentRoute.outputs.map { "\($0.portType.rawValue)" }.joined(separator: ",")
             Self.log.info("Speaker \(on ? "ON" : "OFF", privacy: .public) — engine.isRunning=\(self.engine.isRunning) route=\(outputs, privacy: .public)")
             DebugLog.shared.write("Speaker", "\(on ? "ON" : "OFF") applied. engine=\(self.engine.isRunning ? "running" : "STOPPED") route=\(outputs)")
