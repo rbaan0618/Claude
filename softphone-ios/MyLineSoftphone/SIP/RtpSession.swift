@@ -155,25 +155,23 @@ final class RtpSession {
         let session = AVAudioSession.sharedInstance()
         DebugLog.shared.write("Speaker", "request \(on ? "ON" : "OFF")")
         do {
-            let mode: AVAudioSession.Mode = on ? .videoChat : .voiceChat
-            let options: AVAudioSession.CategoryOptions = on
-                ? [.allowBluetoothHFP, .defaultToSpeaker]
-                : [.allowBluetoothHFP]
-            try session.setCategory(.playAndRecord, mode: mode, options: options)
+            // Apple's recommended pattern is to use ONLY `overrideOutputAudioPort`
+            // for a runtime route switch.  The category is already
+            // `.playAndRecord` (configured at call start) so the override is
+            // honoured without any further setup.
+            //
+            // The previous implementation called `setCategory` with different
+            // options on every toggle.  iOS reacted to that by implicitly
+            // stopping vpio — engine.isRunning went to false, the input tap
+            // was dropped, and the player node lost its scheduled buffers.
+            // Restarting the engine restored isRunning=true but the audio
+            // graph stayed hollow (no mic capture, nothing for the speaker
+            // to play), so the user still heard nothing.  Diagnostic log
+            // proved this exact failure mode.
+            //
+            // Skipping setCategory keeps vpio alive across the toggle.  No
+            // engine restart needed; route changes are instant.
             try session.overrideOutputAudioPort(on ? .speaker : .none)
-
-            // setCategory with different options can implicitly stop the
-            // AVAudioEngine — iOS internally tears down vpio and the engine
-            // is left in `!isRunning` state.  This was the bug behind
-            // "toggle speaker OFF kills all audio": route is correct
-            // (Receiver) but engine.isRunning=false so no PCM flows.
-            // Restart the engine + player whenever the toggle left them
-            // stopped.
-            if !engine.isRunning {
-                DebugLog.shared.write("Speaker", "engine stopped after setCategory — restarting")
-                try engine.start()
-                player?.play()
-            }
 
             let outputs = session.currentRoute.outputs.map { "\($0.portType.rawValue)" }.joined(separator: ",")
             Self.log.info("Speaker \(on ? "ON" : "OFF", privacy: .public) — engine.isRunning=\(self.engine.isRunning) route=\(outputs, privacy: .public)")
