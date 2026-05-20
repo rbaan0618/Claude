@@ -55,7 +55,7 @@ struct DebugLogScreen: View {
                         }
                     }
                 }
-                .onChange(of: log.entries.last?.id) { _, newId in
+                .onChange(of: log.entries.last?.id) { newId in
                     if let id = newId {
                         withAnimation { scroller.scrollTo(id, anchor: .bottom) }
                     }
