@@ -59,6 +59,16 @@ final class SipService: NSObject, ObservableObject {
     private var activeCallUUID: UUID?
     private var isOutgoingCall: Bool = false
 
+    /// Last push we reported to CallKit — used to deduplicate.  iOS can
+    /// queue several PushKit pushes for the same call (re-tries from
+    /// Kamailio, late delivery after the app foregrounds, etc.) and our
+    /// previous handler created a fresh CallKit UUID for each one, leaving
+    /// the user staring at multiple phantom call screens after the app
+    /// came back to the foreground.  We now skip a push if the same
+    /// caller was reported within the last 60 seconds.
+    private var lastPushCaller: String?
+    private var lastPushReportAt: Date?
+
     // PushKit
     private let pushRegistry = PKPushRegistry(queue: .main)
 
@@ -531,12 +541,14 @@ final class SipService: NSObject, ObservableObject {
         update.hasVideo = false
 
         // Always issue a fresh reportNewIncomingCall when a real SIP INVITE
-        // arrives — see commit history for rationale.
-        if let previousUUID = activeCallUUID,
-           callObserver.calls.contains(where: { $0.uuid == previousUUID && !$0.hasEnded }) {
-            Self.log.warning("Ending stale CallKit entry \(previousUUID) before reporting fresh incoming call")
-            DebugLog.shared.write("CallKit", "ending stale UUID \(previousUUID) before fresh report")
-            provider.reportCall(with: previousUUID, endedAt: Date(), reason: .failed)
+        // arrives.  End EVERY stale CallKit entry first — the previous code
+        // only ended `activeCallUUID`, but when a background push storm
+        // leaves multiple phantom calls in CallKit (maxCallsPerCallGroup=1
+        // then rejects new ones), the new INVITE fails to display.
+        let staleLiveCalls = callObserver.calls.filter { !$0.hasEnded }
+        for call in staleLiveCalls {
+            DebugLog.shared.write("CallKit", "ending stale UUID \(call.uuid.uuidString.prefix(8)) before fresh report")
+            provider.reportCall(with: call.uuid, endedAt: Date(), reason: .failed)
         }
         pushPrereportedUUID = nil
         activeCallUUID = nil
@@ -684,33 +696,65 @@ extension SipService: PKPushRegistryDelegate {
         Self.log.info("VoIP push received: caller=\(caller, privacy: .public) name=\(callerName, privacy: .public)")
         DebugLog.shared.write("Push", "VoIP push received caller=\(caller) name=\(callerName)")
 
-        let uuid = UUID()
-        let update = CXCallUpdate()
-        update.remoteHandle = CXHandle(type: .phoneNumber, value: caller)
-        update.localizedCallerName = callerName.isEmpty ? caller : callerName
-        update.hasVideo = false
-
-        // 1) Report the call.  2) Inside the callback, ack the push.
-        DebugLog.shared.write("Push", "calling reportNewIncomingCall uuid=\(uuid.uuidString.prefix(8))")
-        provider.reportNewIncomingCall(with: uuid, update: update) { error in
-            if let error = error {
-                Self.log.error("reportNewIncomingCall failed: \(error.localizedDescription, privacy: .public)")
-                DebugLog.shared.write("Push", "❌ reportNewIncomingCall FAILED: \(error.localizedDescription)")
-            } else {
-                Self.log.info("Push-driven incoming call reported to CallKit (uuid=\(uuid))")
-                DebugLog.shared.write("Push", "✓ push-driven call reported to CallKit")
-            }
-            completion()
-        }
-
-        // Store UUID and wake the SIP stack on the main actor.  When the SIP
-        // INVITE arrives (after our re-registration triggers route[JOIN] in
-        // Kamailio), reportIncomingCall() will detect this pre-reported UUID
-        // and update the existing CallKit entry instead of creating a second.
+        // Apple still REQUIRES us to call reportNewIncomingCall during this
+        // handler — even for duplicate pushes — or iOS will terminate the
+        // app and rate-limit future VoIP pushes.  But we don't want to
+        // show duplicate CallKit screens to the user when iOS delivers a
+        // backlog of pushes for the same call (which happens whenever the
+        // bundle was rate-limited during background and the queued
+        // pushes finally drain when the app returns to foreground).
+        //
+        // Compromise: ALWAYS create + immediately end a synthetic call
+        // entry for duplicate pushes.  iOS treats the requirement as
+        // satisfied, and the user only sees the genuine first call.
         Task { @MainActor in
+            let isDuplicate: Bool = {
+                guard let last = self.lastPushReportAt,
+                      let lastCaller = self.lastPushCaller else { return false }
+                return lastCaller == caller && Date().timeIntervalSince(last) < 60
+            }()
+
+            if isDuplicate {
+                // Apple-required token report, ended immediately so no UI lingers.
+                let dupUUID = UUID()
+                let dupUpdate = CXCallUpdate()
+                dupUpdate.remoteHandle = CXHandle(type: .phoneNumber, value: caller)
+                dupUpdate.localizedCallerName = callerName.isEmpty ? caller : callerName
+                dupUpdate.hasVideo = false
+                DebugLog.shared.write("Push", "duplicate push for \(caller) — reporting+ending to satisfy iOS")
+                self.provider.reportNewIncomingCall(with: dupUUID, update: dupUpdate) { [weak self] _ in
+                    self?.provider.reportCall(with: dupUUID, endedAt: Date(), reason: .failed)
+                    completion()
+                }
+                return
+            }
+
+            // Fresh push — track it for the next dedup check.
+            self.lastPushCaller = caller
+            self.lastPushReportAt = Date()
+
+            let uuid = UUID()
+            let update = CXCallUpdate()
+            update.remoteHandle = CXHandle(type: .phoneNumber, value: caller)
+            update.localizedCallerName = callerName.isEmpty ? caller : callerName
+            update.hasVideo = false
+
             self.activeCallUUID = uuid
             self.isOutgoingCall = false
             self.pushPrereportedUUID = uuid
+
+            DebugLog.shared.write("Push", "calling reportNewIncomingCall uuid=\(uuid.uuidString.prefix(8))")
+            self.provider.reportNewIncomingCall(with: uuid, update: update) { error in
+                if let error = error {
+                    Self.log.error("reportNewIncomingCall failed: \(error.localizedDescription, privacy: .public)")
+                    DebugLog.shared.write("Push", "❌ reportNewIncomingCall FAILED: \(error.localizedDescription)")
+                } else {
+                    Self.log.info("Push-driven incoming call reported to CallKit (uuid=\(uuid))")
+                    DebugLog.shared.write("Push", "✓ push-driven call reported to CallKit")
+                }
+                completion()
+            }
+
             // Restart SIP stack — app was suspended, socket is dead.
             self.sipHandler.start()
         }
