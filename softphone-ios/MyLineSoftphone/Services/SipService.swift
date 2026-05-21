@@ -648,6 +648,7 @@ extension SipService: PKPushRegistryDelegate {
                                   for type: PKPushType) {
         let token = pushCredentials.token.map { String(format: "%02x", $0) }.joined()
         Self.log.info("VoIP push token: \(token, privacy: .public)")
+        DebugLog.shared.write("Push", "PushKit delivered token \(String(token.prefix(16)))…")
         // Pass the token to SipHandler so it is included in every REGISTER request
         // as X-Push-Token. FreeSWITCH stores it alongside the registration and uses
         // it to wake the app via APNs when an INVITE arrives while we are suspended.
@@ -681,6 +682,7 @@ extension SipService: PKPushRegistryDelegate {
         let caller     = payload.dictionaryPayload["caller"]     as? String ?? "Unknown"
         let callerName = payload.dictionaryPayload["callerName"] as? String ?? ""
         Self.log.info("VoIP push received: caller=\(caller, privacy: .public) name=\(callerName, privacy: .public)")
+        DebugLog.shared.write("Push", "VoIP push received caller=\(caller) name=\(callerName)")
 
         let uuid = UUID()
         let update = CXCallUpdate()
@@ -689,11 +691,14 @@ extension SipService: PKPushRegistryDelegate {
         update.hasVideo = false
 
         // 1) Report the call.  2) Inside the callback, ack the push.
+        DebugLog.shared.write("Push", "calling reportNewIncomingCall uuid=\(uuid.uuidString.prefix(8))")
         provider.reportNewIncomingCall(with: uuid, update: update) { error in
             if let error = error {
                 Self.log.error("reportNewIncomingCall failed: \(error.localizedDescription, privacy: .public)")
+                DebugLog.shared.write("Push", "❌ reportNewIncomingCall FAILED: \(error.localizedDescription)")
             } else {
                 Self.log.info("Push-driven incoming call reported to CallKit (uuid=\(uuid))")
+                DebugLog.shared.write("Push", "✓ push-driven call reported to CallKit")
             }
             completion()
         }
