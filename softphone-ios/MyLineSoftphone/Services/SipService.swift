@@ -696,68 +696,87 @@ extension SipService: PKPushRegistryDelegate {
         Self.log.info("VoIP push received: caller=\(caller, privacy: .public) name=\(callerName, privacy: .public)")
         DebugLog.shared.write("Push", "VoIP push received caller=\(caller) name=\(callerName)")
 
-        // Apple still REQUIRES us to call reportNewIncomingCall during this
-        // handler — even for duplicate pushes — or iOS will terminate the
-        // app and rate-limit future VoIP pushes.  But we don't want to
-        // show duplicate CallKit screens to the user when iOS delivers a
-        // backlog of pushes for the same call (which happens whenever the
-        // bundle was rate-limited during background and the queued
-        // pushes finally drain when the app returns to foreground).
-        //
-        // Compromise: ALWAYS create + immediately end a synthetic call
-        // entry for duplicate pushes.  iOS treats the requirement as
-        // satisfied, and the user only sees the genuine first call.
-        Task { @MainActor in
-            let isDuplicate: Bool = {
-                guard let last = self.lastPushReportAt,
-                      let lastCaller = self.lastPushCaller else { return false }
-                return lastCaller == caller && Date().timeIntervalSince(last) < 60
-            }()
+        // CRITICAL: Apple requires reportNewIncomingCall to be called
+        // SYNCHRONOUSLY inside this delegate before the function returns.
+        // Wrapping it in Task { @MainActor in } (as the previous version
+        // did) makes it asynchronous — iOS thinks the contract was
+        // violated, terminates the bundle, AND keeps re-delivering the
+        // push, which is exactly what produced the 6 phantom UUIDs the
+        // user saw.  Thread-safe dedup state lives in a separate non-
+        // isolated singleton so we can check it directly here without an
+        // actor hop.
+        let isDuplicate = PushDedupe.shared.isDuplicate(caller: caller, window: 60)
 
-            if isDuplicate {
-                // Apple-required token report, ended immediately so no UI lingers.
-                let dupUUID = UUID()
-                let dupUpdate = CXCallUpdate()
-                dupUpdate.remoteHandle = CXHandle(type: .phoneNumber, value: caller)
-                dupUpdate.localizedCallerName = callerName.isEmpty ? caller : callerName
-                dupUpdate.hasVideo = false
-                DebugLog.shared.write("Push", "duplicate push for \(caller) — reporting+ending to satisfy iOS")
-                self.provider.reportNewIncomingCall(with: dupUUID, update: dupUpdate) { [weak self] _ in
-                    self?.provider.reportCall(with: dupUUID, endedAt: Date(), reason: .failed)
-                    completion()
-                }
-                return
-            }
+        let uuid = UUID()
+        let update = CXCallUpdate()
+        update.remoteHandle = CXHandle(type: .phoneNumber, value: caller)
+        update.localizedCallerName = callerName.isEmpty ? caller : callerName
+        update.hasVideo = false
 
-            // Fresh push — track it for the next dedup check.
-            self.lastPushCaller = caller
-            self.lastPushReportAt = Date()
-
-            let uuid = UUID()
-            let update = CXCallUpdate()
-            update.remoteHandle = CXHandle(type: .phoneNumber, value: caller)
-            update.localizedCallerName = callerName.isEmpty ? caller : callerName
-            update.hasVideo = false
-
-            self.activeCallUUID = uuid
-            self.isOutgoingCall = false
-            self.pushPrereportedUUID = uuid
-
+        if isDuplicate {
+            DebugLog.shared.write("Push", "duplicate push for \(caller) — reporting+ending to satisfy iOS")
+        } else {
             DebugLog.shared.write("Push", "calling reportNewIncomingCall uuid=\(uuid.uuidString.prefix(8))")
-            self.provider.reportNewIncomingCall(with: uuid, update: update) { error in
-                if let error = error {
-                    Self.log.error("reportNewIncomingCall failed: \(error.localizedDescription, privacy: .public)")
-                    DebugLog.shared.write("Push", "❌ reportNewIncomingCall FAILED: \(error.localizedDescription)")
-                } else {
-                    Self.log.info("Push-driven incoming call reported to CallKit (uuid=\(uuid))")
-                    DebugLog.shared.write("Push", "✓ push-driven call reported to CallKit")
-                }
-                completion()
-            }
-
-            // Restart SIP stack — app was suspended, socket is dead.
-            self.sipHandler.start()
         }
+
+        // Apple-mandated synchronous report.
+        provider.reportNewIncomingCall(with: uuid, update: update) { [weak self] error in
+            if let error = error {
+                Self.log.error("reportNewIncomingCall failed: \(error.localizedDescription, privacy: .public)")
+                DebugLog.shared.write("Push", "❌ reportNewIncomingCall FAILED: \(error.localizedDescription)")
+            } else if isDuplicate {
+                // Immediately end so the duplicate UI never appears.
+                self?.provider.reportCall(with: uuid, endedAt: Date(), reason: .failed)
+                DebugLog.shared.write("Push", "✓ duplicate ended")
+            } else {
+                Self.log.info("Push-driven incoming call reported to CallKit (uuid=\(uuid))")
+                DebugLog.shared.write("Push", "✓ push-driven call reported to CallKit")
+            }
+            completion()
+        }
+
+        // State updates + SIP stack restart go to MainActor (we are
+        // nonisolated here).  Only do this for non-duplicate pushes —
+        // duplicates have already been ended and there's no need to wake
+        // the SIP stack again.
+        if !isDuplicate {
+            Task { @MainActor in
+                self.activeCallUUID = uuid
+                self.isOutgoingCall = false
+                self.pushPrereportedUUID = uuid
+                self.sipHandler.start()
+            }
+        }
+    }
+}
+
+/// Thread-safe push deduplication state.  Lives outside `SipService` so the
+/// PushKit delegate (which is `nonisolated`) can check it synchronously
+/// without bouncing to `@MainActor` — that bounce was the bug behind the
+/// queued-push storms (delayed `reportNewIncomingCall` violates Apple's
+/// PushKit contract and iOS responds by re-firing the push).
+final class PushDedupe {
+    static let shared = PushDedupe()
+    private let lock = NSLock()
+    private var lastCaller: String?
+    private var lastTime: Date?
+
+    /// Returns true if a push for the same caller arrived within `window`
+    /// seconds.  Also bumps the "last push" tracker so a stream of identical
+    /// pushes converges to one displayed CallKit screen + N silent dupes.
+    func isDuplicate(caller: String, window: TimeInterval) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if let lastT = lastTime, let lastC = lastCaller,
+           lastC == caller, Date().timeIntervalSince(lastT) < window {
+            // Still within window — treat as duplicate AND extend the window
+            // so a long burst all gets deduped.
+            lastTime = Date()
+            return true
+        }
+        lastCaller = caller
+        lastTime = Date()
+        return false
     }
 }
 
