@@ -1280,27 +1280,42 @@ final class SipHandler: ObservableObject {
         DebugLog.shared.write("SIP", "INVITE received Call-ID=\(newCallId) currentState=\(String(describing: callState))")
 
         if callState != .idle {
-            // If the new INVITE belongs to the SAME call we're already tracking
-            // (Call-ID match), it's just an INVITE retransmit — let the regular
-            // flow re-send 180 Ringing.  Fall through.
-            //
-            // Otherwise: a DIFFERENT call is trying to ring while we're in a
-            // transient state (.incoming/.calling/.ringing).  That almost
-            // always means the previous CANCEL was lost in transit and our
-            // state is stuck.  Force-reset rather than reply 486 Busy Here,
-            // so the new caller still rings the phone — being permanently
-            // unreachable is much worse than briefly losing a non-existent
-            // dead call.  Only a truly active call (.confirmed / .hold) sends
-            // 486.
-            if newCallId != currentCallId {
-                if callState == .confirmed || callState == .hold {
-                    let resp = buildMirroredResponse(code: 486, reason: "Busy Here", request: message, toTag: generateTag())
-                    sendSip(resp)
-                    return
-                }
-                Self.log.warning("Stale transient call state \(String(describing: self.callState)) — resetting to accept new INVITE \(newCallId, privacy: .public)")
-                resetCallState()
+            if newCallId == currentCallId {
+                // Same Call-ID — this is an INVITE retransmit.  Kamailio
+                // resends every 500ms (SIP timer T1) until the device
+                // sends a provisional or final response.  If we let this
+                // path re-execute setCallState(.incoming, ...) every
+                // time, the SipService observer fires reportNewIncoming-
+                // Call AGAIN for the same call → 4 phantom CallKit
+                // screens, all with different UUIDs.
+                //
+                // Just re-send 180 Ringing (idempotent) and return.  All
+                // dialog state has already been populated by the first
+                // arrival; touching it again is also a state-corruption
+                // risk if we've moved on to .ringing/.confirmed.
+                DebugLog.shared.write("SIP", "INVITE retransmit Call-ID=\(newCallId) state=\(String(describing: callState)) — re-sending 180 only")
+                let ringing = buildMirroredResponse(code: 180, reason: "Ringing", request: message, toTag: currentLocalTag)
+                sendSip(ringing)
+                return
             }
+            // Different Call-ID arrived while we're mid-call.
+            //
+            // If we're truly busy (.confirmed/.hold) reply 486 Busy Here
+            // — the caller will get a busy tone.
+            //
+            // If we're in a transient state (.incoming/.calling/.ringing)
+            // the previous CANCEL/BYE was probably lost in transit and
+            // our state is stuck.  Force-reset rather than reply 486
+            // Busy Here, so the new caller still rings the phone —
+            // being permanently unreachable is much worse than briefly
+            // losing a non-existent dead call.
+            if callState == .confirmed || callState == .hold {
+                let resp = buildMirroredResponse(code: 486, reason: "Busy Here", request: message, toTag: generateTag())
+                sendSip(resp)
+                return
+            }
+            Self.log.warning("Stale transient call state \(String(describing: self.callState)) — resetting to accept new INVITE \(newCallId, privacy: .public)")
+            resetCallState()
         }
         incomingInviteMsg = message
         currentCallId = newCallId
