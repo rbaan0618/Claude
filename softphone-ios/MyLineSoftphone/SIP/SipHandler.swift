@@ -94,6 +94,11 @@ final class SipHandler: ObservableObject {
     private var currentCallId: String = ""
     private var currentLocalTag: String = ""
     private var currentRemoteTag: String = ""
+    /// Top Via branch of the INVITE we actually accepted as the current
+    /// incoming call. Diagnostic only — lets the log show whether a later
+    /// same-Call-ID INVITE (dismissed as a "retransmit") is in fact a
+    /// DIFFERENT branch, i.e. the server's resumed INVITE.
+    private var acceptedInviteBranch: String = ""
     private var currentRemoteUri: String = ""
     /// Dialog route set per RFC 3261 §12.1.2.  Reversed Record-Route from the
     /// 2xx response (UAC) or the INVITE (UAS).  Used as Route headers on
@@ -849,12 +854,11 @@ final class SipHandler: ObservableObject {
                 DebugLog.shared.write("SIP", "STUN window: dropped non-UTF8 datagram (\(slice.count)B)")
                 return
             }
-            let firstLine = msg.split(separator: "\r\n").first.map(String.init) ?? ""
-            DebugLog.shared.write("SIP", "STUN window: re-injecting SIP packet (\(slice.count)B) — \(firstLine)")
+            DebugLog.shared.write("RX", "stun-window \(slice.count)B gen(rx=\(myGen) cur=\(self.socketGeneration)) \(Self.packetDiag(msg))")
             self.ioQueue.async { [weak self] in
                 guard let self else { return }
                 guard self.socketGeneration == myGen else {
-                    DebugLog.shared.write("SIP", "dropping stale STUN-window packet (gen \(myGen)≠\(self.socketGeneration))")
+                    DebugLog.shared.write("SIP", "dropping stale STUN-window packet (gen \(myGen)≠\(self.socketGeneration)) — \(Self.packetDiag(msg))")
                     return
                 }
                 if msg.hasPrefix("SIP/2.0") { self.handleResponse(msg) }
@@ -874,6 +878,11 @@ final class SipHandler: ObservableObject {
 
         startReceiverLoop(generation: myGen)
         register()
+        // ORDERING MARKER (diagnostic): the server only resumes the parked
+        // INVITE AFTER it receives this REGISTER. So in the log, any INVITE
+        // logged BEFORE this line is stale buffered data; the resumed INVITE
+        // must appear AFTER it (and should carry a DIFFERENT Via branch).
+        DebugLog.shared.write("RX", "── wake-REGISTER SENT (gen=\(myGen)) — INVITEs after this line should be the RESUMED INVITE (new branch); INVITEs before are stale ──")
     }
 
     private func stopBlocking() {
@@ -974,14 +983,17 @@ final class SipHandler: ObservableObject {
                 DebugLog.shared.write("SIP", "receiveLoop: dropped non-UTF8/empty datagram (\(n)B)")
                 continue
             }
+            // DECISIVE DIAGNOSTIC (logging only): fingerprint EVERY datagram the
+            // instant it is read — before any gen filtering — with the captured
+            // vs current generation. The Via branch proves stale-vs-resumed.
+            DebugLog.shared.write("RX", "recv \(n)B gen(rx=\(generation) cur=\(socketGeneration)) \(Self.packetDiag(msg))")
             ioQueue.async { [weak self] in
                 guard let self else { return }
                 // Drop anything read on a stale (pre-wake) socket — see
                 // socketGeneration.  Acting on a buffered original INVITE here
                 // is what made push-wake calls die.
                 guard self.socketGeneration == generation else {
-                    let first = msg.split(separator: "\r\n").first.map(String.init) ?? ""
-                    DebugLog.shared.write("SIP", "dropping stale-socket packet (gen \(generation)≠\(self.socketGeneration)) — \(first)")
+                    DebugLog.shared.write("SIP", "dropping stale-socket packet (gen \(generation)≠\(self.socketGeneration)) — \(Self.packetDiag(msg))")
                     return
                 }
                 if msg.hasPrefix("SIP/2.0") {
@@ -1297,6 +1309,30 @@ final class SipHandler: ObservableObject {
 
     // MARK: - Request dispatch
 
+    /// Topmost Via `branch=` token. This is THE field that distinguishes a
+    /// stale buffered INVITE (and the timeout-CANCEL that shares its branch)
+    /// from the server's resumed INVITE: same Call-ID, but a NEW branch on the
+    /// resumed t_relay. Diagnostic only.
+    private static func topViaBranch(_ message: String) -> String {
+        guard let via = extractHeader(message, name: "Via") else { return "?" }
+        if let r = via.range(of: #"branch=([^;\s]+)"#, options: .regularExpression) {
+            return String(via[r].dropFirst("branch=".count))
+        }
+        return "?"
+    }
+
+    /// One-line decisive fingerprint of an incoming datagram, so a single test
+    /// log proves which packet is stale vs resumed instead of us inferring.
+    private static func packetDiag(_ message: String) -> String {
+        let firstLine = message.split(separator: "\r\n").first.map(String.init) ?? ""
+        let cid     = extractHeader(message, name: "Call-ID") ?? "?"
+        let cseq    = extractHeader(message, name: "CSeq") ?? "?"
+        let branch  = topViaBranch(message)
+        let fromTag = extractTag(message, headerName: "From") ?? "-"
+        let toTag   = extractTag(message, headerName: "To") ?? "-"
+        return "\(firstLine) | cid=\(cid) branch=\(branch) cseq=\(cseq) fromTag=\(fromTag) toTag=\(toTag)"
+    }
+
     private func handleRequest(_ message: String) {
         let method = message.split(separator: " ").first.map(String.init) ?? ""
         let msgCallId = Self.extractHeader(message, name: "Call-ID") ?? ""
@@ -1356,6 +1392,7 @@ final class SipHandler: ObservableObject {
                 Self.log.info("Remote BYE ignored: msgCallId=\(msgCallId, privacy: .public) currentCallId=\(self.currentCallId, privacy: .public) state=\(String(describing: self.callState), privacy: .public)")
             }
         case "CANCEL":
+            DebugLog.shared.write("SIP", "CANCEL received branch=\(Self.topViaBranch(message)) acceptedBranch=\(acceptedInviteBranch) cid=\(msgCallId) state=\(String(describing: callState)) — ⚠️ if branch≠acceptedBranch this is the STALE branch's CANCEL (RFC3261 says it should NOT cancel our resumed INVITE)")
             if msgCallId == currentCallId {
                 handleIncomingCancel(message)
             } else {
@@ -1392,7 +1429,7 @@ final class SipHandler: ObservableObject {
 
     private func handleIncomingInvite(_ message: String) {
         let newCallId = Self.extractHeader(message, name: "Call-ID") ?? ""
-        DebugLog.shared.write("SIP", "INVITE received Call-ID=\(newCallId) currentState=\(String(describing: callState))")
+        DebugLog.shared.write("SIP", "INVITE received Call-ID=\(newCallId) branch=\(Self.topViaBranch(message)) currentState=\(String(describing: callState))")
 
         if callState != .idle {
             if newCallId == currentCallId {
@@ -1408,7 +1445,7 @@ final class SipHandler: ObservableObject {
                 // dialog state has already been populated by the first
                 // arrival; touching it again is also a state-corruption
                 // risk if we've moved on to .ringing/.confirmed.
-                DebugLog.shared.write("SIP", "INVITE retransmit Call-ID=\(newCallId) state=\(String(describing: callState)) — re-sending 180 only")
+                DebugLog.shared.write("SIP", "INVITE treated as retransmit (same Call-ID) Call-ID=\(newCallId) branch=\(Self.topViaBranch(message)) acceptedBranch=\(acceptedInviteBranch) state=\(String(describing: callState)) — re-sending 180 only. ⚠️ if branch≠acceptedBranch this is the RESUMED INVITE being wrongly dismissed")
                 let ringing = buildMirroredResponse(code: 180, reason: "Ringing", request: message, toTag: currentLocalTag)
                 sendSip(ringing)
                 return
@@ -1434,6 +1471,7 @@ final class SipHandler: ObservableObject {
         }
         incomingInviteMsg = message
         currentCallId = newCallId
+        acceptedInviteBranch = Self.topViaBranch(message)
         currentLocalTag = generateTag()
         currentRemoteTag = Self.extractTag(message, headerName: "From") ?? ""
         currentCallDirection = "inbound"
