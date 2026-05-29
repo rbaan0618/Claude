@@ -540,10 +540,23 @@ final class SipService: NSObject, ObservableObject {
         update.localizedCallerName = name.isEmpty ? number : name
         update.hasVideo = false
 
-        // Always issue a fresh reportNewIncomingCall when a real SIP INVITE
-        // arrives.  End EVERY stale CallKit entry first — the previous code
-        // only ended `activeCallUUID`, but when a background push storm
-        // leaves multiple phantom calls in CallKit (maxCallsPerCallGroup=1
+        // Background-push path: a VoIP push already reported THIS call to
+        // CallKit, and the user may already be looking at — or have already
+        // tapped Answer on — that UUID.  Tearing it down and reporting a fresh
+        // UUID (as we do for the SIP-only path below) would KILL the very call
+        // the user is answering, dropping them back to the dialpad with no
+        // audio.  Instead, just refresh the caller info on the existing call.
+        if let existing = pushPrereportedUUID {
+            DebugLog.shared.write("CallKit", "INVITE matched push-prereported UUID \(existing.uuidString.prefix(8)) — updating in place (not re-reporting)")
+            activeCallUUID = existing
+            provider.reportCall(with: existing, updated: update)
+            return
+        }
+
+        // SIP-only path (app already foregrounded, no push): issue a fresh
+        // reportNewIncomingCall.  End EVERY stale CallKit entry first — the
+        // previous code only ended `activeCallUUID`, but when a background push
+        // storm leaves multiple phantom calls in CallKit (maxCallsPerCallGroup=1
         // then rejects new ones), the new INVITE fails to display.
         let staleLiveCalls = callObserver.calls.filter { !$0.hasEnded }
         for call in staleLiveCalls {

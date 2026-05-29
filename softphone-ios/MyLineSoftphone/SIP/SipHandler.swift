@@ -105,6 +105,11 @@ final class SipHandler: ObservableObject {
     private var currentCSeq: Int = 1
     private var currentInviteBranch: String = ""
     private var incomingInviteMsg: String?
+    /// Set when the user taps Answer (CallKit) before the SIP INVITE has
+    /// actually arrived — common on the background-push path where CallKit is
+    /// shown from the push and the INVITE lands a moment later. When the INVITE
+    /// arrives we auto-answer so the tap is never lost.
+    private var pendingAnswer: Bool = false
     private var pendingHoldMode: Bool = false
     private var pendingReferTarget: String = ""
     private var referAuthAttempted: Bool = false
@@ -322,38 +327,54 @@ final class SipHandler: ObservableObject {
 
     func answerCall() {
         ioQueue.async { [weak self] in
-            guard let self, self.callState == .incoming, let invite = self.incomingInviteMsg else { return }
-
-            if self.localRtpPort == 0 { self.localRtpPort = self.allocateRtpPort() }
-            let sdp = self.buildSdp(rtpPort: self.localRtpPort, holdMode: false)
-            let contactAddr = self.contactAddress()
-
-            // Use buildMirroredResponse so the 200 OK echoes EVERY Via from
-            // the INVITE (RFC 3261 §17.2.1).  Building this manually with
-            // just the top Via was silently dropping the answer at the SBC:
-            // dSIPRouter popped its own Via and found no more hops to forward
-            // to FusionPBX.  FusionPBX therefore never saw the call as
-            // answered, no RTP was set up, and the iPhone's CallKit UI was
-            // the only thing that thought the call was live.
-            let response = self.buildMirroredResponse(
-                code: 200,
-                reason: "OK",
-                request: invite,
-                toTag: self.currentLocalTag,
-                extraHeaders: [
-                    ("Contact", "<sip:\(self.config.username)@\(contactAddr)>"),
-                    ("Content-Type", "application/sdp"),
-                    ("Allow", "INVITE,ACK,BYE,CANCEL,OPTIONS,NOTIFY,REFER"),
-                ],
-                body: sdp
-            )
-
-            self.sendSip(response)
-            self.setCallState(.confirmed, number: self.remoteNumber, name: self.remoteName)
-            // Only start RTP if CallKit has already activated the audio session.
-            // If not yet, handleAudioActivation() will start it when the session is ready.
-            if self.callKitAudioActive { self.startRtp() }
+            guard let self else { return }
+            if self.callState == .incoming, self.incomingInviteMsg != nil {
+                self.performAnswer()
+            } else {
+                // The INVITE hasn't arrived yet (push woke us and the user
+                // tapped Answer before the SIP INVITE landed). Remember the
+                // intent; handleIncomingInvite() will auto-answer on arrival.
+                self.pendingAnswer = true
+                DebugLog.shared.write("SIP", "answerCall: no incoming INVITE yet (state=\(String(describing: self.callState))) — will auto-answer when it arrives")
+            }
         }
+    }
+
+    /// Sends the 200 OK for the current incoming INVITE. MUST be called on
+    /// `ioQueue` with `callState == .incoming` and `incomingInviteMsg` set.
+    private func performAnswer() {
+        guard self.callState == .incoming, let invite = self.incomingInviteMsg else { return }
+        self.pendingAnswer = false
+
+        if self.localRtpPort == 0 { self.localRtpPort = self.allocateRtpPort() }
+        let sdp = self.buildSdp(rtpPort: self.localRtpPort, holdMode: false)
+        let contactAddr = self.contactAddress()
+
+        // Use buildMirroredResponse so the 200 OK echoes EVERY Via from
+        // the INVITE (RFC 3261 §17.2.1).  Building this manually with
+        // just the top Via was silently dropping the answer at the SBC:
+        // dSIPRouter popped its own Via and found no more hops to forward
+        // to FusionPBX.  FusionPBX therefore never saw the call as
+        // answered, no RTP was set up, and the iPhone's CallKit UI was
+        // the only thing that thought the call was live.
+        let response = self.buildMirroredResponse(
+            code: 200,
+            reason: "OK",
+            request: invite,
+            toTag: self.currentLocalTag,
+            extraHeaders: [
+                ("Contact", "<sip:\(self.config.username)@\(contactAddr)>"),
+                ("Content-Type", "application/sdp"),
+                ("Allow", "INVITE,ACK,BYE,CANCEL,OPTIONS,NOTIFY,REFER"),
+            ],
+            body: sdp
+        )
+
+        self.sendSip(response)
+        self.setCallState(.confirmed, number: self.remoteNumber, name: self.remoteName)
+        // Only start RTP if CallKit has already activated the audio session.
+        // If not yet, handleAudioActivation() will start it when the session is ready.
+        if self.callKitAudioActive { self.startRtp() }
     }
 
     func hangup() {
@@ -1348,6 +1369,13 @@ final class SipHandler: ObservableObject {
 
         let ringing = buildMirroredResponse(code: 180, reason: "Ringing", request: message, toTag: currentLocalTag)
         sendSip(ringing)
+
+        // Background-push race: if the user already tapped Answer (CallKit was
+        // shown from the VoIP push) before this INVITE arrived, answer now.
+        if pendingAnswer {
+            DebugLog.shared.write("SIP", "auto-answering INVITE Call-ID=\(newCallId) — user tapped Answer before it arrived")
+            performAnswer()
+        }
     }
 
     private func handleReInvite(_ message: String) {
@@ -2085,6 +2113,7 @@ final class SipHandler: ObservableObject {
         currentCSeq = 1
         currentInviteBranch = ""
         incomingInviteMsg = nil
+        pendingAnswer = false
         inviteAuthAttempted = false
         pendingHoldMode = false
         pendingReferTarget = ""
