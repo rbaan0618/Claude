@@ -718,7 +718,13 @@ extension SipService: PKPushRegistryDelegate {
         // user saw.  Thread-safe dedup state lives in a separate non-
         // isolated singleton so we can check it directly here without an
         // actor hop.
-        let isDuplicate = PushDedupe.shared.isDuplicate(caller: caller, window: 60)
+        // Dedup window: only meant to collapse iOS RE-DELIVERING the *same*
+        // push (a burst that arrives within ~1-2s, and now largely moot since
+        // reportNewIncomingCall is synchronous).  It must NOT block a genuine
+        // redial: a caller who gets no answer and calls back ~30s later was
+        // previously dropped as a "duplicate" because the window was 60s and
+        // self-extending.  8s absorbs storms yet lets redials ring.
+        let isDuplicate = PushDedupe.shared.isDuplicate(caller: caller, window: 8)
 
         let uuid = UUID()
         let update = CXCallUpdate()
