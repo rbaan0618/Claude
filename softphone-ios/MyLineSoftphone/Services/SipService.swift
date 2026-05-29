@@ -608,9 +608,27 @@ extension SipService: CXProviderDelegate {
     }
 
     nonisolated func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
+        // CRITICAL: configure (do NOT activate) the audio session category
+        // SYNCHRONOUSLY here, before fulfilling. CallKit only calls
+        // provider(_:didActivate:) — which is the ONLY place we start RTP — if the
+        // app has set the session category in the answer action. Previously we did
+        // ALL audio setup in didActivate, so it was circular: didActivate never
+        // fired because the category was never configured → no RTP → no audio.
+        // Must be synchronous in this delegate: doing it after a Task{@MainActor}
+        // hop is too late (CallKit has already decided whether to activate).
+        // Match RtpSession.configureAudioSession exactly so CallKit's activation
+        // and our later setup agree on the category/mode.
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetoothHFP])
+            DebugLog.shared.write("Audio", "CXAnswerCallAction: audio category preconfigured (.playAndRecord/.voiceChat) — expecting didActivate next")
+        } catch {
+            DebugLog.shared.write("Audio", "❌ CXAnswerCallAction: setCategory failed: \(error.localizedDescription)")
+        }
+        action.fulfill()
+
         Task { @MainActor in
             self.sipHandler.answerCall()
-            action.fulfill()
             // When answered from the lock screen iOS does not automatically bring the
             // app to foreground — request scene activation so InCallScreen is visible.
             if #available(iOS 13, *) {
