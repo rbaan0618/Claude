@@ -53,6 +53,9 @@ final class RtpSession {
 
     private var sequenceNumber: UInt16 = 0
     private var timestamp: UInt32 = 0
+    // Diagnostic packet counters — distinguish one-way vs no-way audio.
+    private var sentCount: Int = 0
+    private var recvCount: Int = 0
     private var ssrc: UInt32 = UInt32.random(in: 0...UInt32.max)
     private var sendingDtmf: Bool = false
 
@@ -82,6 +85,7 @@ final class RtpSession {
     // MARK: - Lifecycle
 
     func start() {
+        DebugLog.shared.write("Audio", "RtpSession.start codec=\(codecType) local=\(localPort) remote=\(remoteHost):\(remotePort) existingFD=\(existingSocketFD)")
         configureAudioSession()
 
         if existingSocketFD >= 0 {
@@ -93,10 +97,12 @@ final class RtpSession {
         }
         guard socketFD >= 0 else {
             Self.log.error("RTP socket bind failed")
+            DebugLog.shared.write("Audio", "❌ RtpSession ABORTED — socket bind failed port=\(localPort)")
             return
         }
         guard resolveRemote() else {
             Self.log.error("RTP remote resolve failed")
+            DebugLog.shared.write("Audio", "❌ RtpSession ABORTED — could not resolve remote \(remoteHost):\(remotePort)")
             return
         }
 
@@ -233,8 +239,10 @@ final class RtpSession {
         // Capture: tap the input at its native format and convert to 8 kHz Int16 mono.
         let input = engine.inputNode
         let hwFormat = input.inputFormat(forBus: 0)
+        DebugLog.shared.write("Audio", "startAudioEngine: inputNode hwSampleRate=\(hwFormat.sampleRate) ch=\(hwFormat.channelCount)")
         guard hwFormat.sampleRate > 0 else {
             Self.log.error("Input format has zero sample rate (no mic permission?)")
+            DebugLog.shared.write("Audio", "❌ startAudioEngine ABORTED — input hwSampleRate=0 (mic not ready on push-wake / no permission). NO audio either direction, capture tap + engine NOT started.")
             return
         }
         guard let captureOut = AVAudioFormat(commonFormat: .pcmFormatInt16,
@@ -250,8 +258,10 @@ final class RtpSession {
         do {
             try engine.start()
             playerNode.play()
+            DebugLog.shared.write("Audio", "startAudioEngine OK — engine.isRunning=\(engine.isRunning), capture tap installed, player playing")
         } catch {
             Self.log.error("AVAudioEngine start failed: \(String(describing: error), privacy: .public)")
+            DebugLog.shared.write("Audio", "❌ AVAudioEngine.start() threw: \(error.localizedDescription)")
         }
     }
 
@@ -319,13 +329,19 @@ final class RtpSession {
     private func sendPacket(_ packet: [UInt8]) {
         guard socketFD >= 0 else { return }
         var addr = remoteSockaddr
-        _ = packet.withUnsafeBufferPointer { buf in
+        let sent = packet.withUnsafeBufferPointer { buf in
             withUnsafePointer(to: &addr) { saPtr -> Int in
                 saPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { raw in
                     Darwin.sendto(socketFD, buf.baseAddress, buf.count, 0, raw,
                                   socklen_t(MemoryLayout<sockaddr_in>.size))
                 }
             }
+        }
+        sentCount += 1
+        if sentCount == 1 {
+            DebugLog.shared.write("Audio", "RTP TX: first packet sent (\(sent)B) → \(remoteHost):\(remotePort)\(sent < 0 ? " ⚠️ sendto returned \(sent) errno=\(errno)" : "")")
+        } else if sentCount % 250 == 0 {
+            DebugLog.shared.write("Audio", "RTP TX: \(sentCount) packets sent")
         }
     }
 
@@ -345,6 +361,12 @@ final class RtpSession {
                 Darwin.recv(socketFD, buf.baseAddress, buf.count, 0)
             }
             if n <= Self.rtpHeaderSize { continue }
+            recvCount += 1
+            if recvCount == 1 {
+                DebugLog.shared.write("Audio", "RTP RX: first packet received (\(n)B) pt=\(buffer[1] & 0x7F)")
+            } else if recvCount % 250 == 0 {
+                DebugLog.shared.write("Audio", "RTP RX: \(recvCount) packets received")
+            }
             let pt = buffer[1] & 0x7F
             let payloadLen = Int(n) - Self.rtpHeaderSize
             switch pt {

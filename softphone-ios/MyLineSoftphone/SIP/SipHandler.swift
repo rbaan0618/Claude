@@ -420,9 +420,14 @@ final class SipHandler: ObservableObject {
 
         self.sendSip(response)
         self.setCallState(.confirmed, number: self.remoteNumber, name: self.remoteName)
+        DebugLog.shared.write("Audio", "performAnswer: 200 OK sent. callKitAudioActive=\(self.callKitAudioActive) remoteRtp=\(self.remoteRtpHost):\(self.remoteRtpPort) codec=\(self.negotiatedCodec) advertisedSdpIp=\(self.publicIp.isEmpty ? self.localIp : self.publicIp) localRtpPort=\(self.localRtpPort)")
         // Only start RTP if CallKit has already activated the audio session.
         // If not yet, handleAudioActivation() will start it when the session is ready.
-        if self.callKitAudioActive { self.startRtp() }
+        if self.callKitAudioActive {
+            self.startRtp()
+        } else {
+            DebugLog.shared.write("Audio", "performAnswer: deferring RTP start — waiting for CallKit didActivate")
+        }
     }
 
     func hangup() {
@@ -605,11 +610,13 @@ final class SipHandler: ObservableObject {
             guard self.callState == .confirmed || self.callState == .hold else {
                 // Call not confirmed yet; startRtp() will be called once 200 OK/answer arrives.
                 Self.log.info("Audio activated by CallKit — call not confirmed yet, will start RTP on answer")
+                DebugLog.shared.write("Audio", "handleAudioActivation: state=\(String(describing: self.callState)) not confirmed yet — RTP will start on answer")
                 return
             }
             // Always stop any stale session and restart clean — handles both the
             // case where RTP was never started and where it started too early.
             Self.log.info("Audio activated by CallKit — starting RTP")
+            DebugLog.shared.write("Audio", "handleAudioActivation: state=confirmed — (re)starting RTP")
             self.rtpSession?.stop()
             self.rtpSession = nil
             self.startRtp()
@@ -2052,8 +2059,10 @@ final class SipHandler: ObservableObject {
     private func startRtp() {
         if remoteRtpHost.isEmpty || remoteRtpPort == 0 {
             Self.log.error("Cannot start RTP: no remote endpoint")
+            DebugLog.shared.write("Audio", "❌ startRtp ABORTED — no remote endpoint (host=\(remoteRtpHost) port=\(remoteRtpPort)). SDP answer parse failed?")
             return
         }
+        DebugLog.shared.write("Audio", "startRtp → local \(localRtpPort) → \(remoteRtpHost):\(remoteRtpPort) codec=\(negotiatedCodec) reuseSipSocket=\(rtpSocketFD >= 0)")
         rtpSession?.stop()
         let existing = rtpSocketFD
         rtpSocketFD = -1 // transfer ownership to RtpSession

@@ -657,6 +657,7 @@ extension SipService: CXProviderDelegate {
     /// inside handleAudioActivation — splitting it across two places/threads caused
     /// partial configurations that left inputNode.inputFormat returning zero sampleRate.
     nonisolated func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
+        DebugLog.shared.write("Audio", "CallKit didActivate audio session — starting RTP path")
         Task { @MainActor in
             self.stopRingback()
             self.sipHandler.handleAudioActivation()
@@ -665,6 +666,7 @@ extension SipService: CXProviderDelegate {
 
     /// CallKit deactivated the audio session — call ended or interrupted.
     nonisolated func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
+        DebugLog.shared.write("Audio", "CallKit didDeactivate audio session")
         Task { @MainActor in
             self.sipHandler.handleAudioDeactivation()
         }
