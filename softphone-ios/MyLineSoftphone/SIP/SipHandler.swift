@@ -771,26 +771,32 @@ final class SipHandler: ObservableObject {
 
     private func startInternal() {
         dispatchPrecondition(condition: .onQueue(ioQueue))
+        DebugLog.shared.write("SIP", "startInternal: configValid=\(config.isValid) transport=\(config.transport) domain=\(config.domain)")
         guard config.isValid else {
             Self.log.warning("Invalid SIP config — cannot start")
+            DebugLog.shared.write("SIP", "❌ startInternal aborted — invalid SIP config")
             return
         }
         if socketFD >= 0 { Darwin.close(socketFD); socketFD = -1 }
         socketFD = Self.createBoundUdpSocket(port: UInt16(config.localPort), timeoutSec: 5)
         guard socketFD >= 0 else {
             Self.log.error("Failed to bind UDP \(self.config.localPort)")
+            DebugLog.shared.write("SIP", "❌ startInternal aborted — UDP bind failed port=\(config.localPort)")
             updateRegistration(.failed)
             return
         }
         localIp = LocalAddress.primaryIPv4() ?? "0.0.0.0"
         Self.log.info("SIP started on \(self.localIp, privacy: .public):\(self.config.localPort)")
+        DebugLog.shared.write("SIP", "socket bound localIp=\(localIp):\(config.localPort) — running STUN")
 
         if let m = StunClient.discover(socketFD: socketFD) {
             publicIp = m.ip
             publicPort = m.port
             Self.log.info("STUN: \(self.publicIp, privacy: .public):\(self.publicPort)")
+            DebugLog.shared.write("SIP", "STUN ok \(publicIp):\(publicPort) — sending REGISTER")
         } else {
             Self.log.warning("STUN discovery failed — will learn from server Via")
+            DebugLog.shared.write("SIP", "STUN failed — sending REGISTER anyway")
         }
 
         startReceiverLoop()
@@ -1547,6 +1553,7 @@ final class SipHandler: ObservableObject {
             viaBranch: nil
         )
         updateRegistration(.registering)
+        DebugLog.shared.write("SIP", "REGISTER sent → \(config.domain) contact=\(contactUri)")
         sendSip(req)
     }
 
@@ -2251,6 +2258,7 @@ final class SipHandler: ObservableObject {
     }
 
     private func updateRegistration(_ state: RegistrationState) {
+        DebugLog.shared.write("SIP", "registration → \(String(describing: state))")
         DispatchQueue.main.async {
             self.registrationState = state
             self.onRegistrationChanged?(state)

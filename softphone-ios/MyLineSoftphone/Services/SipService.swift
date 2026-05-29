@@ -757,6 +757,7 @@ extension SipService: PKPushRegistryDelegate {
                 self.activeCallUUID = uuid
                 self.isOutgoingCall = false
                 self.pushPrereportedUUID = uuid
+                DebugLog.shared.write("Push", "waking SIP stack — calling sipHandler.start() to re-REGISTER (server resumes the parked INVITE on REGISTER)")
                 self.sipHandler.start()
             }
         }
