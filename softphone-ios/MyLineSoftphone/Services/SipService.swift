@@ -26,7 +26,13 @@ final class SipService: NSObject, ObservableObject {
 
     private static let log = Logger(subsystem: "com.mylinetelecom.softphone", category: "SipService")
 
-    let sipHandler = SipHandler()
+    // nonisolated(unsafe): the PushKit delegate (pushRegistry(_:didReceiveIncomingPushWith:…))
+    // is nonisolated and must call sipHandler.prepareForWake() SYNCHRONOUSLY — a
+    // Task { @MainActor } hop would be async and lose the race against the
+    // orphaned receiver thread's stale-packet dispatch. SipHandler serializes its
+    // own mutable state on an internal ioQueue and prepareForWake only does a
+    // single Int increment, so direct cross-isolation access here is safe.
+    nonisolated(unsafe) let sipHandler = SipHandler()
 
     // Republished so ContentView (which observes SipService) re-renders on call/registration changes.
     @Published private(set) var callState: CallState = .idle
@@ -725,6 +731,20 @@ extension SipService: PKPushRegistryDelegate {
         // previously dropped as a "duplicate" because the window was 60s and
         // self-extending.  8s absorbs storms yet lets redials ring.
         let isDuplicate = PushDedupe.shared.isDuplicate(caller: caller, window: 8)
+
+        // Invalidate the pre-wake socket generation IMMEDIATELY and
+        // synchronously — before reportNewIncomingCall, before the @MainActor
+        // hop, before anything. The orphaned receiver thread is, right now,
+        // resuming from its blocked recvfrom and about to dispatch the stale
+        // packets iOS buffered while we were suspended (original INVITE +
+        // retransmits + the server's branch CANCEL). If those are processed
+        // they poison call state and the genuine resumed INVITE gets dropped as
+        // a retransmit. Bumping the generation here wins the race so every
+        // pre-wake packet is dropped at dispatch. (Only the wake path needs
+        // this; a duplicate push does not restart the stack.)
+        if !isDuplicate {
+            sipHandler.prepareForWake()
+        }
 
         let uuid = UUID()
         let update = CXCallUpdate()

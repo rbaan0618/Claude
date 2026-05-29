@@ -238,6 +238,35 @@ final class SipHandler: ObservableObject {
         }
     }
 
+    /// Synchronously invalidates the current socket generation the instant a
+    /// VoIP push wakes the app — BEFORE the orphaned receiver thread (resuming
+    /// from its blocked `recvfrom` on the pre-wake socket) can dispatch the
+    /// stale packets iOS buffered while the process was suspended: the server's
+    /// first-pass original INVITE, its retransmits, and the branch CANCEL the
+    /// server emits after the 408 timeout. If any of those are processed they
+    /// drive call state .idle→.incoming→.disconnected, so the genuine *resumed*
+    /// INVITE (same Call-ID, delivered seconds later on the fresh socket) is
+    /// dismissed as a "retransmit" and the user can never answer.
+    ///
+    /// Bumping the generation inside `startInternal` (commit 3a7e5c4) was too
+    /// late: it runs on `ioQueue` and lost the race to the orphaned thread's
+    /// already-enqueued stale dispatch (processed ~6ms after the push, before
+    /// `startInternal` even began). Doing the bump here — off-queue, as the very
+    /// first action of the PushKit delegate — guarantees it happens-before any
+    /// stale dispatch runs on `ioQueue`, so the guards in `receiveLoop` and the
+    /// STUN re-inject closure drop every pre-wake packet. `startInternal` then
+    /// bumps again for the fresh socket.
+    ///
+    /// Thread-safety: `socketGeneration` is a word-sized `Int` already read
+    /// across threads (the receiver loop's `while` check) and we only ever
+    /// increment it; a benign lost-update with `startInternal`'s own increment
+    /// still leaves the value strictly greater than any generation captured by a
+    /// pre-wake packet, so stale packets are dropped regardless.
+    func prepareForWake() {
+        socketGeneration &+= 1
+        DebugLog.shared.write("SIP", "prepareForWake: socket generation invalidated → \(socketGeneration) — pre-wake stale packets (original INVITE/retransmits/CANCEL) will be dropped at dispatch")
+    }
+
     func stop() {
         ioQueue.async { [weak self] in
             self?.stopBlocking()
