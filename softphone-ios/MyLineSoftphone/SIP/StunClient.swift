@@ -30,7 +30,16 @@ enum StunClient {
 
     /// Performs a STUN binding request on the given already-bound UDP socket file descriptor.
     /// Returns the server-reflexive address, or `nil` if discovery failed on all servers.
-    static func discover(socketFD: Int32) -> Mapping? {
+    ///
+    /// `onNonStunPacket` is invoked with any datagram that arrives on the shared
+    /// socket while we are waiting for the STUN binding response but is NOT a STUN
+    /// response (e.g. a SIP INVITE the server is retransmitting during a push-wake).
+    /// Because STUN reuses the *same* UDP socket as SIP signaling, a blind `recv`
+    /// here would otherwise silently swallow that INVITE and the call would never
+    /// ring.  We re-inject those packets back into the SIP receive path instead of
+    /// discarding them, and keep waiting for the real STUN response.
+    static func discover(socketFD: Int32,
+                         onNonStunPacket: ((ArraySlice<UInt8>) -> Void)? = nil) -> Mapping? {
         // Save old recv timeout so we can restore it.
         var oldTv = timeval()
         var oldLen = socklen_t(MemoryLayout<timeval>.size)
@@ -43,14 +52,29 @@ enum StunClient {
         }
 
         for server in servers {
-            if let result = tryServer(socketFD: socketFD, host: server) {
+            if let result = tryServer(socketFD: socketFD, host: server, onNonStunPacket: onNonStunPacket) {
                 return result
             }
         }
         return nil
     }
 
-    private static func tryServer(socketFD: Int32, host: String) -> Mapping? {
+    /// Distinguishes a STUN binding response from any other datagram (e.g. SIP).
+    /// A STUN message has message-type 0x0101 (binding response) in the first two
+    /// bytes and the magic cookie 0x2112A442 at byte offset 4.  SIP messages start
+    /// with an ASCII method/version token (0x49 'I', 0x53 'S', 0x4F 'O', …) so the
+    /// first byte is never 0x01 — the discriminator is unambiguous.
+    private static func isStunBindingResponse(_ bytes: [UInt8], _ length: Int) -> Bool {
+        guard length >= 20 else { return false }
+        let type = (UInt16(bytes[0]) << 8) | UInt16(bytes[1])
+        guard type == bindingResponse else { return false }
+        let cookie = (UInt32(bytes[4]) << 24) | (UInt32(bytes[5]) << 16)
+                   | (UInt32(bytes[6]) << 8) | UInt32(bytes[7])
+        return cookie == magicCookie
+    }
+
+    private static func tryServer(socketFD: Int32, host: String,
+                                  onNonStunPacket: ((ArraySlice<UInt8>) -> Void)?) -> Mapping? {
         var hints = addrinfo(
             ai_flags: 0,
             ai_family: AF_INET,
@@ -74,14 +98,28 @@ enum StunClient {
         }
         guard sent > 0 else { return nil }
 
-        var buffer = [UInt8](repeating: 0, count: 512)
-        let received = buffer.withUnsafeMutableBytes { raw -> Int in
-            guard let base = raw.baseAddress else { return -1 }
-            return recv(socketFD, base, raw.count, 0)
-        }
-        guard received > 0 else { return nil }
+        // Wait for the STUN binding response, but tolerate other datagrams
+        // (SIP!) arriving on this shared socket.  Loop until the overall
+        // per-server deadline; the socket's SO_RCVTIMEO bounds each recv.
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        var buffer = [UInt8](repeating: 0, count: 8192)
+        while Date() < deadline {
+            let received = buffer.withUnsafeMutableBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return -1 }
+                return recv(socketFD, base, raw.count, 0)
+            }
+            guard received > 0 else { return nil } // timeout / error for this server
 
-        return parseBindingResponse(bytes: buffer, length: received)
+            if isStunBindingResponse(buffer, received) {
+                return parseBindingResponse(bytes: buffer, length: received)
+            }
+
+            // Not a STUN response — a SIP packet (or stray datagram) landed on
+            // the shared socket during discovery.  Hand it to the SIP receive
+            // path instead of dropping it, then keep waiting for STUN.
+            onNonStunPacket?(buffer[0..<received])
+        }
+        return nil
     }
 
     // MARK: - Binding request

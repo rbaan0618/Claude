@@ -789,7 +789,27 @@ final class SipHandler: ObservableObject {
         Self.log.info("SIP started on \(self.localIp, privacy: .public):\(self.config.localPort)")
         DebugLog.shared.write("SIP", "socket bound localIp=\(localIp):\(config.localPort) — running STUN")
 
-        if let m = StunClient.discover(socketFD: socketFD) {
+        // STUN shares this UDP socket with SIP.  If a SIP packet (e.g. the
+        // server's retransmitting resumed INVITE during a push-wake) arrives
+        // while STUN is waiting for its binding response, re-inject it into the
+        // SIP receive path instead of letting STUN's recv swallow it — that
+        // silent drop was why background calls never rang.
+        let onNonStun: (ArraySlice<UInt8>) -> Void = { [weak self] slice in
+            guard let self else { return }
+            guard let msg = String(bytes: slice, encoding: .utf8), !msg.isEmpty else {
+                DebugLog.shared.write("SIP", "STUN window: dropped non-UTF8 datagram (\(slice.count)B)")
+                return
+            }
+            let firstLine = msg.split(separator: "\r\n").first.map(String.init) ?? ""
+            DebugLog.shared.write("SIP", "STUN window: re-injecting SIP packet (\(slice.count)B) — \(firstLine)")
+            self.ioQueue.async { [weak self] in
+                guard let self else { return }
+                if msg.hasPrefix("SIP/2.0") { self.handleResponse(msg) }
+                else { self.handleRequest(msg) }
+            }
+        }
+
+        if let m = StunClient.discover(socketFD: socketFD, onNonStunPacket: onNonStun) {
             publicIp = m.ip
             publicPort = m.port
             Self.log.info("STUN: \(self.publicIp, privacy: .public):\(self.publicPort)")
@@ -893,7 +913,10 @@ final class SipHandler: ObservableObject {
                 // Timeout or error — loop and check cancellation.
                 continue
             }
-            guard let msg = String(bytes: buffer[0..<n], encoding: .utf8), !msg.isEmpty else { continue }
+            guard let msg = String(bytes: buffer[0..<n], encoding: .utf8), !msg.isEmpty else {
+                DebugLog.shared.write("SIP", "receiveLoop: dropped non-UTF8/empty datagram (\(n)B)")
+                continue
+            }
             ioQueue.async { [weak self] in
                 guard let self else { return }
                 if msg.hasPrefix("SIP/2.0") {
