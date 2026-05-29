@@ -159,6 +159,20 @@ final class SipHandler: ObservableObject {
     // MARK: - Background jobs
 
     private var receiverThread: Thread?
+    /// Monotonic id of the current UDP socket + receiver loop.  Bumped every
+    /// time we (re)create the socket.  Two jobs:
+    ///  1. Lets an orphaned old receiver loop exit (it checks its captured gen
+    ///     against this — the previous `!receiverThread.isCancelled` check read
+    ///     the *shared* property and so never stopped the old thread).
+    ///  2. Lets us DROP any SIP packet that was read on a pre-wake socket.
+    ///     On a VoIP push-wake the server has already relayed the original
+    ///     INVITE to our (suspended) device; iOS buffers it and the old loop
+    ///     reads it on wake.  Acting on that stale INVITE made us answer a
+    ///     branch the server had already abandoned → it CANCELled us → the
+    ///     real (resumed, same Call-ID) INVITE was then dropped as a
+    ///     "retransmit" and the call died.  Dropping stale-generation packets
+    ///     means we only ever act on the fresh resumed INVITE.
+    private var socketGeneration: Int = 0
     private var keepaliveTimer: DispatchSourceTimer?
     private var reRegisterTimer: DispatchSourceTimer?
     private var pendingKeepalives: Int = 0
@@ -785,6 +799,12 @@ final class SipHandler: ObservableObject {
             updateRegistration(.failed)
             return
         }
+        // New socket → new generation, set NOW (before STUN) so any orphaned
+        // old receiver loop exits immediately and any packet it already pulled
+        // off the pre-wake socket is dropped at dispatch.  Captured below by
+        // both the STUN re-inject closure and startReceiverLoop.
+        socketGeneration &+= 1
+        let myGen = socketGeneration
         localIp = LocalAddress.primaryIPv4() ?? "0.0.0.0"
         Self.log.info("SIP started on \(self.localIp, privacy: .public):\(self.config.localPort)")
         DebugLog.shared.write("SIP", "socket bound localIp=\(localIp):\(config.localPort) — running STUN")
@@ -804,6 +824,10 @@ final class SipHandler: ObservableObject {
             DebugLog.shared.write("SIP", "STUN window: re-injecting SIP packet (\(slice.count)B) — \(firstLine)")
             self.ioQueue.async { [weak self] in
                 guard let self else { return }
+                guard self.socketGeneration == myGen else {
+                    DebugLog.shared.write("SIP", "dropping stale STUN-window packet (gen \(myGen)≠\(self.socketGeneration))")
+                    return
+                }
                 if msg.hasPrefix("SIP/2.0") { self.handleResponse(msg) }
                 else { self.handleRequest(msg) }
             }
@@ -819,7 +843,7 @@ final class SipHandler: ObservableObject {
             DebugLog.shared.write("SIP", "STUN failed — sending REGISTER anyway")
         }
 
-        startReceiverLoop()
+        startReceiverLoop(generation: myGen)
         register()
     }
 
@@ -886,18 +910,22 @@ final class SipHandler: ObservableObject {
 
     // MARK: - Receiver loop
 
-    private func startReceiverLoop() {
+    private func startReceiverLoop(generation gen: Int) {
+        // `gen` is the generation assigned when the socket was (re)created in
+        // startInternal.  The loop exits as soon as socketGeneration moves past
+        // it, and packets it read are dropped at dispatch if the gen no longer
+        // matches — see socketGeneration.
         let thread = Thread { [weak self] in
-            self?.receiveLoop()
+            self?.receiveLoop(generation: gen)
         }
         thread.name = "SipReceiver"
         thread.start()
         receiverThread = thread
     }
 
-    private func receiveLoop() {
+    private func receiveLoop(generation: Int) {
         var buffer = [UInt8](repeating: 0, count: 8192)
-        while let thread = receiverThread, !thread.isCancelled {
+        while socketGeneration == generation {
             let fd = socketFD
             if fd < 0 { return }
             var from = sockaddr_storage()
@@ -919,6 +947,14 @@ final class SipHandler: ObservableObject {
             }
             ioQueue.async { [weak self] in
                 guard let self else { return }
+                // Drop anything read on a stale (pre-wake) socket — see
+                // socketGeneration.  Acting on a buffered original INVITE here
+                // is what made push-wake calls die.
+                guard self.socketGeneration == generation else {
+                    let first = msg.split(separator: "\r\n").first.map(String.init) ?? ""
+                    DebugLog.shared.write("SIP", "dropping stale-socket packet (gen \(generation)≠\(self.socketGeneration)) — \(first)")
+                    return
+                }
                 if msg.hasPrefix("SIP/2.0") {
                     self.handleResponse(msg)
                 } else {
