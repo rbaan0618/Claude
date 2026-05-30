@@ -2071,7 +2071,8 @@ final class SipHandler: ObservableObject {
             remoteHost: remoteRtpHost,
             remotePort: UInt16(remoteRtpPort),
             existingSocketFD: existing,
-            codecType: UInt8(negotiatedCodec)
+            codecType: UInt8(negotiatedCodec),
+            workQueue: ioQueue
         )
         rtpSession?.start()
         Self.log.info("RTP started: local \(self.localRtpPort) -> \(self.remoteRtpHost, privacy: .public):\(self.remoteRtpPort)")
@@ -2087,7 +2088,8 @@ final class SipHandler: ObservableObject {
             remoteHost: consultRemoteRtpHost,
             remotePort: UInt16(consultRemoteRtpPort),
             existingSocketFD: existing,
-            codecType: UInt8(consultNegotiatedCodec)
+            codecType: UInt8(consultNegotiatedCodec),
+            workQueue: ioQueue
         )
         consultRtpSession?.start()
     }

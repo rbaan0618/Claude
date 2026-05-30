@@ -34,6 +34,13 @@ final class RtpSession {
     private let existingSocketFD: Int32
     private var codecType: UInt8
 
+    /// Serial queue (SipHandler.ioQueue) that all RtpSession lifecycle calls
+    /// (start/stop/setSpeakerOutput) run on. The config-change observer funnels
+    /// its rebuild through the same queue so it never races those calls.
+    private let workQueue: DispatchQueue
+    /// Token for the AVAudioEngineConfigurationChange observer (route-change healing).
+    private var configChangeObserver: NSObjectProtocol?
+
     // MARK: - State
 
     private var socketFD: Int32 = -1
@@ -73,13 +80,15 @@ final class RtpSession {
         remoteHost: String,
         remotePort: UInt16,
         existingSocketFD: Int32 = -1,
-        codecType: UInt8 = RtpSession.pcmuPayloadType
+        codecType: UInt8 = RtpSession.pcmuPayloadType,
+        workQueue: DispatchQueue
     ) {
         self.localPort = localPort
         self.remoteHost = remoteHost
         self.remotePort = remotePort
         self.existingSocketFD = existingSocketFD
         self.codecType = codecType
+        self.workQueue = workQueue
     }
 
     // MARK: - Lifecycle
@@ -119,6 +128,22 @@ final class RtpSession {
         default: break
         }
 
+        // Heal the audio graph after asynchronous route changes (speaker toggle,
+        // headset plug/unplug). overrideOutputAudioPort posts this notification
+        // HUNDREDS of ms later, and AVAudioEngine stops itself when it fires —
+        // which is exactly why turning the speaker on left the engine STOPPED
+        // (no mic capture → TX stalls, player stopped → no speaker output). The
+        // synchronous rebuild in setSpeakerOutput starts the engine, then this
+        // delayed notification stops it again; this observer restarts it.
+        configChangeObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: nil
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            self.workQueue.async { self.handleConfigurationChange() }
+        }
+
         startAudioEngine()
         startReceive()
         Self.log.info("RTP started port=\(self.localPort) -> \(self.remoteHost):\(self.remotePort)")
@@ -126,6 +151,10 @@ final class RtpSession {
 
     func stop() {
         stopped = true
+        if let observer = configChangeObserver {
+            NotificationCenter.default.removeObserver(observer)
+            configChangeObserver = nil
+        }
         receiveThread?.cancel(); receiveThread = nil
 
         engine.inputNode.removeTap(onBus: 0)
@@ -172,19 +201,14 @@ final class RtpSession {
             // that has consistently worked across iOS releases is a full
             // tear-down + re-attach of the AVAudioEngine graph after the
             // route change.
-            DebugLog.shared.write("Speaker", "tearing down audio graph")
-            if engine.isRunning { engine.stop() }
-            engine.inputNode.removeTap(onBus: 0)
-            if let oldPlayer = player {
-                engine.detach(oldPlayer)
-                player = nil
-            }
+            DebugLog.shared.write("Speaker", "tearing down + rebuilding audio graph for new route")
+            rebuildAudioGraph()
 
-            // 3) Rebuild via the same path used at call start.
-            DebugLog.shared.write("Speaker", "rebuilding audio graph for new route")
-            startAudioEngine()
-
-            // 4) Report what iOS settled on.
+            // 4) Report what iOS settled on. NOTE: the route change posts an
+            // AVAudioEngineConfigurationChange notification asynchronously
+            // (hundreds of ms later) that STOPS the engine again — so the
+            // engine may read "running" here yet be stopped moments later.
+            // handleConfigurationChange() restarts it when that fires.
             let outputs = session.currentRoute.outputs.map { "\($0.portType.rawValue)" }.joined(separator: ",")
             let inputs  = session.currentRoute.inputs.map  { "\($0.portType.rawValue)" }.joined(separator: ",")
             let hwSampleRate = session.sampleRate
@@ -194,6 +218,31 @@ final class RtpSession {
             Self.log.error("setSpeakerOutput failed: \(String(describing: error), privacy: .public)")
             DebugLog.shared.write("Speaker", "❌ failed: \(error.localizedDescription)")
         }
+    }
+
+    /// Tear down and re-establish the AVAudioEngine render graph. Shared by the
+    /// proactive speaker-toggle path (setSpeakerOutput) and the reactive
+    /// config-change healer. Always runs on `workQueue` so the two never overlap.
+    private func rebuildAudioGraph() {
+        if engine.isRunning { engine.stop() }
+        engine.inputNode.removeTap(onBus: 0)
+        if let oldPlayer = player {
+            engine.detach(oldPlayer)
+            player = nil
+        }
+        startAudioEngine()
+    }
+
+    /// Fires when iOS reconfigures the engine's I/O — e.g. the delayed route
+    /// change from overrideOutputAudioPort, or a headset plug/unplug. AVAudioEngine
+    /// stops itself on these events; rebuild + restart so audio keeps flowing both
+    /// ways. Guarded so we only rebuild when the engine actually stopped.
+    private func handleConfigurationChange() {
+        guard !stopped else { return }
+        if engine.isRunning { return } // still healthy — nothing to do
+        DebugLog.shared.write("Speaker", "config-change heal — route change stopped the engine, rebuilding graph")
+        rebuildAudioGraph()
+        DebugLog.shared.write("Speaker", "config-change heal done. engine=\(engine.isRunning ? "running" : "STOPPED")")
     }
 
     func mute(_ muted: Bool) {
